@@ -1,0 +1,3 @@
+[server]
+# The saved database is about 130 MB and can grow. The quant CSV is not uploaded here.
+maxUploadSize = 1024

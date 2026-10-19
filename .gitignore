@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.streamlit/secrets.toml
+data/*.duckdb
+data/*.duckdb.wal
+data/uploads/
+.idea/
+.vscode/
