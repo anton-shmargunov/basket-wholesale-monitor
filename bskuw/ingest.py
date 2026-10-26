@@ -23,14 +23,17 @@ QUANT_COLUMNS = (
     ("brand", "Brand"),
     ("model", "Model"),
     ("size", "Size"),
+    ("section", "Section"),
+    ("aspect", "Aspect"),
+    ("rim", "Rim"),
     ("tread", "Tread"),
     ("majority", "Majority"),
     ("location", "Location"),
-    ("sales order (int) date", "Sales Order (int) Date"),
+    ("incoming date to saleable location", "Incoming date to saleable location"),
     ("sales order (int) number", "Sales Order (int) Number"),
 )
 
-# A tire on this location, with a sales order date and number, is a wholesale sale.
+# A tire on this location is a wholesale sale. The sales order date and number are not required.
 WHOLESALE_LOCATION = "Physical Locations / FRD / Utilisation Scrap"
 
 
@@ -72,7 +75,7 @@ def load_quant(path):
     """Replace sku_dim and wholesale sales from one quant CSV.
 
     The file is scanned once. Wholesale rows are tires whose Location is
-    WHOLESALE_LOCATION and whose sales order date and number are both filled in.
+    WHOLESALE_LOCATION. The stored date is Incoming date to saleable location.
     """
     path = _existing_file(path, "Quant")
     if path.stat().st_size == 0:
@@ -97,9 +100,9 @@ def load_quant(path):
     )[0]
     last_sale_date = db.fetch_one(
         """
-        SELECT max(parse_sale_date(sale_date_raw))
+        SELECT max(parse_sale_date(incoming_date_raw))
         FROM quant_raw
-        WHERE sale_date_raw IS NOT NULL
+        WHERE incoming_date_raw IS NOT NULL
         """
     )[0]
 
@@ -114,11 +117,11 @@ def load_quant(path):
         db.execute(
             """
             INSERT INTO sku_dim (
-                sku, name, brand, model, size, tread, condition,
+                sku, name, brand, model, size, section, aspect, rim, tread, condition,
                 internal_category, majority, source
             )
             SELECT
-                sku, name, brand, model, size, tread, condition,
+                sku, name, brand, model, size, section, aspect, rim, tread, condition,
                 internal_category, majority, source
             FROM sku_stage
             """
@@ -126,8 +129,8 @@ def load_quant(path):
         db.execute("DELETE FROM wholesale")
         db.execute(
             """
-            INSERT INTO wholesale (sku, sale_date, sale_number, source_file)
-            SELECT sku, sale_date, sale_number, source_file
+            INSERT INTO wholesale (sku, sale_date, sale_number, source_file, majority)
+            SELECT sku, sale_date, sale_number, source_file, majority
             FROM wholesale_stage
             """
         )
@@ -141,14 +144,14 @@ def load_quant(path):
 
 
 def capture_quant_last_date(path):
-    """Store the latest sales-order date in the whole quant file.
+    """Store the latest incoming date to saleable location in the whole quant file.
 
     This reads every row, not only wholesale sales. The loaded tables stay as they are.
     """
     path = _existing_file(path, "Quant")
     header = _header(path)
     mapping = _match_columns(header, QUANT_COLUMNS, path.name)
-    column = _quote(mapping["sales order (int) date"])
+    column = _quote(mapping["incoming date to saleable location"])
     last_sale_date = db.fetch_one(
         """
         SELECT max(parse_sale_date(NULLIF(trim(CAST({column} AS VARCHAR)), '')))
@@ -199,6 +202,9 @@ def load_mysql():
                 brand VARCHAR,
                 model VARCHAR,
                 size VARCHAR,
+                section VARCHAR,
+                aspect VARCHAR,
+                rim VARCHAR,
                 tread VARCHAR,
                 condition VARCHAR,
                 internal_category VARCHAR,
@@ -215,7 +221,7 @@ def load_mysql():
             rows = [row for row in rows if row is not None]
             if rows:
                 db.executemany(
-                    "INSERT INTO sku_stage VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'mysql')",
+                    "INSERT INTO sku_stage VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, NULL, NULL, 'mysql')",
                     rows,
                 )
     finally:
@@ -231,6 +237,9 @@ def load_mysql():
             mode(brand) AS brand,
             mode(model) AS model,
             mode(size) AS size,
+            NULL AS section,
+            NULL AS aspect,
+            NULL AS rim,
             mode(tread) AS tread,
             mode(condition) AS condition,
             NULL AS internal_category,
@@ -253,12 +262,15 @@ def _quant_raw(path, mapping):
         ("brand", "brand"),
         ("model", "model"),
         ("size", "size"),
+        ("section", "section"),
+        ("aspect", "aspect"),
+        ("rim", "rim"),
         ("tread", "tread"),
         ("condition", "condition"),
         ("internal category", "internal_category"),
         ("majority", "majority"),
         ("location", "location"),
-        ("sales order (int) date", "sale_date_raw"),
+        ("incoming date to saleable location", "incoming_date_raw"),
         ("sales order (int) number", "sale_number"),
     )
     select_list = ", ".join(
@@ -290,6 +302,9 @@ def _sku_stage_from_quant():
             mode(brand) AS brand,
             mode(model) AS model,
             mode(size) AS size,
+            mode(section) AS section,
+            mode(aspect) AS aspect,
+            mode(rim) AS rim,
             mode(tread) AS tread,
             mode(condition) AS condition,
             mode(internal_category) AS internal_category,
@@ -309,13 +324,12 @@ def _wholesale_stage_from_quant(path):
         CREATE TEMP TABLE wholesale_stage AS
         SELECT
             sku,
-            parse_sale_date(sale_date_raw) AS sale_date,
+            parse_sale_date(incoming_date_raw) AS sale_date,
             sale_number,
-            ? AS source_file
+            ? AS source_file,
+            majority
         FROM quant_raw
         WHERE location = ?
-          AND sale_date_raw IS NOT NULL
-          AND sale_number IS NOT NULL
         """,
         [str(path), WHOLESALE_LOCATION],
     )
@@ -330,11 +344,11 @@ def _replace_sku_dim(source):
         db.execute(
             """
             INSERT INTO sku_dim (
-                sku, name, brand, model, size, tread, condition,
+                sku, name, brand, model, size, section, aspect, rim, tread, condition,
                 internal_category, majority, source
             )
             SELECT
-                sku, name, brand, model, size, tread, condition,
+                sku, name, brand, model, size, section, aspect, rim, tread, condition,
                 internal_category, majority, source
             FROM sku_stage
             """
@@ -355,7 +369,8 @@ def _tracking_stage_from_csv(path):
             NULLIF(trim(CAST({product_bs} AS VARCHAR)), '') AS product_bs,
             NULLIF(trim(CAST({sku} AS VARCHAR)), '') AS sku,
             TRY_CAST(NULLIF(trim(CAST({stock} AS VARCHAR)), '') AS DOUBLE) AS stock_qty_w,
-            ? AS source_file
+            ? AS source_file,
+            {grade} AS grade
         FROM read_csv(?, header = true, all_varchar = true)
         """.format(
             week=_quote(mapping["year_week"]),
@@ -363,6 +378,7 @@ def _tracking_stage_from_csv(path):
             product_bs=_quote(mapping["product bs"]),
             sku=_quote(mapping["sku"]),
             stock=_quote(mapping["stockqty_w"]),
+            grade=_grade_select(_optional_column(header, "grade")),
         ),
         [str(path), str(path)],
     )
@@ -388,11 +404,19 @@ def _tracking_stage_from_xlsx(path, on_progress=None):
 
 
 def _try_tracking_stage_from_duckdb(read_path, source_file):
-    """Project the five tracking columns with read_xlsx.
+    """Project the tracking columns with read_xlsx.
 
     all_varchar keeps a trailing Total row from aborting the scan. Callers
-    drop rows whose SKU does not start with SKU.
+    drop rows whose SKU does not start with SKU. A file without grade is read
+    again with an empty grade.
     """
+    if _try_tracking_xlsx(read_path, source_file, True):
+        return True
+    return _try_tracking_xlsx(read_path, source_file, False)
+
+
+def _try_tracking_xlsx(read_path, source_file, with_grade):
+    grade_sql = 'NULLIF(upper(trim(CAST("grade" AS VARCHAR))), \'\')' if with_grade else "CAST(NULL AS VARCHAR)"
     try:
         _load_excel_extension()
         db.execute("DROP TABLE IF EXISTS tracking_stage")
@@ -405,9 +429,10 @@ def _try_tracking_stage_from_duckdb(read_path, source_file):
                 NULLIF(trim(CAST("product BS" AS VARCHAR)), '') AS product_bs,
                 NULLIF(trim(CAST("SKU" AS VARCHAR)), '') AS sku,
                 TRY_CAST("StockQty_W" AS DOUBLE) AS stock_qty_w,
-                ? AS source_file
+                ? AS source_file,
+                {grade} AS grade
             FROM read_xlsx(?, header = true, all_varchar = true, sheet = 'Export')
-            """,
+            """.format(grade=grade_sql),
             [str(source_file), str(read_path)],
         )
         return True
@@ -479,7 +504,8 @@ def _tracking_stage_from_openpyxl(path, on_progress=None):
             product_bs VARCHAR,
             sku VARCHAR,
             stock_qty_w DOUBLE,
-            source_file VARCHAR
+            source_file VARCHAR,
+            grade VARCHAR
         )
         """
     )
@@ -494,6 +520,9 @@ def _tracking_stage_from_openpyxl(path, on_progress=None):
         names = ["" if cell is None else str(cell).strip() for cell in header]
         mapping = _match_columns(names, TRACKING_COLUMNS, path.name)
         indexes = {key: names.index(mapping[key]) for key in mapping}
+        grade_name = _optional_column(names, "grade")
+        if grade_name:
+            indexes["grade"] = names.index(grade_name)
         source = str(path)
         batch = []
         kept = 0
@@ -504,12 +533,12 @@ def _tracking_stage_from_openpyxl(path, on_progress=None):
             batch.append(record)
             kept += 1
             if len(batch) >= 5000:
-                db.executemany("INSERT INTO tracking_stage VALUES (?, ?, ?, ?, ?, ?)", batch)
+                db.executemany("INSERT INTO tracking_stage VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
                 batch = []
                 if on_progress:
                     on_progress(kept)
         if batch:
-            db.executemany("INSERT INTO tracking_stage VALUES (?, ?, ?, ?, ?, ?)", batch)
+            db.executemany("INSERT INTO tracking_stage VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
             if on_progress:
                 on_progress(kept)
     finally:
@@ -528,6 +557,9 @@ def _tracking_record(raw, indexes, source):
     basket = _as_text(cell("basket"))
     if not sku or not sku.upper().startswith("SKU") or not year_week or not basket:
         return None
+    grade = _as_text(cell("grade")) if "grade" in indexes else None
+    if grade:
+        grade = grade.upper()
     return (
         year_week,
         basket,
@@ -535,6 +567,7 @@ def _tracking_record(raw, indexes, source):
         sku,
         _as_float(cell("stockqty_w")),
         source,
+        grade,
     )
 
 
@@ -588,6 +621,20 @@ def _header(path):
     if not any(header):
         raise ValueError(f"{path.name} has no header row.")
     return header
+
+
+def _optional_column(header, key):
+    """Return the original header for a column that may be absent."""
+    for name in header:
+        if " ".join(str(name).strip().lower().split()) == key:
+            return str(name).strip()
+    return None
+
+
+def _grade_select(column_name):
+    if not column_name:
+        return "CAST(NULL AS VARCHAR)"
+    return "NULLIF(upper(trim(CAST({col} AS VARCHAR))), '')".format(col=_quote(column_name))
 
 
 def _match_columns(header, required, file_name):

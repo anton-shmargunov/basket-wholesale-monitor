@@ -4,7 +4,7 @@ state so they survive a switch to another page.
 
 import streamlit as st
 
-from bskuw.dates import PRESETS, preset_range
+from bskuw.dates import DATE_LABEL, PRESETS, preset_range
 
 
 def restore_widgets(keys):
@@ -40,7 +40,7 @@ def ensure_subset(key, options):
 
 
 def sale_date_controls(prefix):
-    """Sales-order preset, start, and end. Empty start or end is unlimited."""
+    """Incoming-date preset, start, and end. Empty start or end is unlimited."""
     preset_key = prefix + "_preset"
     start_key = prefix + "_start"
     end_key = prefix + "_end"
@@ -78,12 +78,12 @@ def sale_date_controls(prefix):
 
     if last_date is None:
         st.caption(
-            "The quant report has no sales order date yet. "
+            "The quant report has no incoming date to saleable location yet. "
             "Last week, last month, and last year stay empty until that date is known."
         )
     else:
         st.caption(
-            "Quant report last sales order date: {last_date}. "
+            "Quant report last incoming date to saleable location: {last_date}. "
             "Last week, last month, and last year end on this date.".format(
                 last_date=last_date.isoformat()[:10]
             )
@@ -92,13 +92,13 @@ def sale_date_controls(prefix):
     date_cols = st.columns(3)
     with date_cols[0]:
         st.selectbox(
-            "Sales order date",
+            DATE_LABEL,
             PRESETS,
             key=preset_key,
             on_change=apply_preset,
             help=(
                 "empty clears both dates. Last week is the 7 days ending on the quant report's "
-                "last sales order date. Last month is the 30 days ending on that date. "
+                "last incoming date to saleable location. Last month is the 30 days ending on that date. "
                 "Last year is the 365 days ending on that date."
             ),
         )
@@ -132,7 +132,7 @@ def _last_quant_date():
     path = quant_source_path()
     if not path:
         return None
-    with st.spinner("Reading the last sales order date from the quant report…"):
+    with st.spinner("Reading the last incoming date to saleable location from the quant report…"):
         try:
             return ingest.capture_quant_last_date(path)
         except Exception as exc:

@@ -18,9 +18,14 @@ FILTER_KEYS = (
     "basket_baskets",
     "basket_product_bs",
     "basket_sku",
+    "basket_tread",
     "basket_size",
+    "basket_section",
+    "basket_aspect",
+    "basket_rim",
     "basket_brand",
     "basket_name",
+    "basket_grade",
     "basket_group",
     "basket_wholesale_min",
     "basket_wholesale_max",
@@ -70,9 +75,12 @@ st.title("Basket SKUs")
 st.caption(
     "SKUs in the selected baskets for one week. "
     "Stock is that week's snapshot. "
-    "Wholesale is how many times that SKU was sold as wholesale in the sales-order date range. "
-    "Wholesale min and max keep SKUs whose own count is inside the range. "
-    "A SKU in two selected baskets shows the same wholesale count on both rows of the SKU table."
+    "Wholesale is how many times that SKU was sold as wholesale in the incoming-date range. "
+    "Grade A and grade B are separate rows. "
+    "Stock is the tracking grade. "
+    "Wholesale is that grade's Majority, including a grade that has no stock row. "
+    "Wholesale min and max keep rows whose own count is inside the range. "
+    "A SKU in two selected baskets shows the same wholesale count on both rows of that grade."
 )
 
 restore_widgets(FILTER_KEYS)
@@ -86,7 +94,7 @@ if queries.status()["tracking_rows"] == 0:
 
 weeks = queries.list_weeks()
 ensure_choice("basket_week", weeks)
-ensure_choice("basket_group", queries.WHOLESALE_GROUPS, default="size")
+ensure_choice("basket_group", queries.WHOLESALE_GROUPS, default="Size")
 scope_cols = st.columns(2)
 with scope_cols[0]:
     week = st.selectbox("Week", weeks, key="basket_week")
@@ -98,6 +106,8 @@ basket_options = [TOTAL, TOTAL_BASKETS, NOT_IN_BASKET] + list(baskets)
 product_bs_values = queries.list_product_bs(week)
 ensure_subset("basket_baskets", basket_options)
 ensure_subset("basket_product_bs", product_bs_values)
+tread_values = queries.list_treads()
+ensure_subset("basket_tread", tread_values)
 
 with st.container(border=True):
     st.markdown("**Filters**")
@@ -114,8 +124,14 @@ with st.container(border=True):
                 "Not in Basket includes only those wholesale SKUs."
             ),
         )
-        sku = st.text_input("SKU contains", key="basket_sku")
-        size = st.text_input("Size contains", key="basket_size")
+        sku = st.text_input("SKU", key="basket_sku", help="Exact SKU. Empty means any SKU.")
+        chosen_treads = st.multiselect(
+            "Tread",
+            tread_values,
+            placeholder="All",
+            key="basket_tread",
+            help="Empty means any tread. Values come from the Tread column in the quant report.",
+        )
     st.session_state["_basket_baskets_prev"] = list(chosen_baskets or [])
     with filter_cols[1]:
         chosen_product_bs = st.multiselect(
@@ -124,8 +140,27 @@ with st.container(border=True):
             placeholder="All",
             key="basket_product_bs",
         )
-        brand = st.text_input("Brand contains", key="basket_brand")
+        brand = st.text_input("Brand", key="basket_brand", help="Exact brand. Empty means any brand.")
         name = st.text_input("Name contains", key="basket_name")
+        ensure_choice("basket_grade", queries.GRADE_OPTIONS, default="")
+        grade = st.selectbox(
+            "Grade",
+            queries.GRADE_OPTIONS,
+            key="basket_grade",
+            format_func=lambda value: value if value else " ",
+            help=queries.GRADE_HELP,
+        )
+    with st.container(border=True):
+        st.caption("Size")
+        size_cols = st.columns(4)
+        with size_cols[0]:
+            size = st.text_input("Size", key="basket_size", help="Exact size. Empty means any size.")
+        with size_cols[1]:
+            section = st.text_input("Section", key="basket_section", help="Exact section. Empty means any section.")
+        with size_cols[2]:
+            aspect = st.text_input("Aspect", key="basket_aspect", help="Exact aspect. Empty means any aspect.")
+        with size_cols[3]:
+            rim = st.text_input("Rim", key="basket_rim", help="Exact rim. Empty means any rim.")
     with st.container(border=True):
         st.caption("Wholesale")
         wholesale_cols = st.columns(2)
@@ -141,6 +176,14 @@ if start is not None and end is not None and start > end:
 if wholesale_min is not None and wholesale_max is not None and wholesale_min > wholesale_max:
     st.error("Wholesale min is above max.")
     st.stop()
+if grade in ("A", "B"):
+    loaded_grade = queries.grade_data_loaded()
+    if not loaded_grade["tracking"] or not loaded_grade["wholesale"]:
+        st.info(
+            "Reload the tracking report and the quant report on the Data page. "
+            "Stock of a grade comes from the tracking file. "
+            "Wholesale of a grade comes from Majority on each tire, even when that grade has no stock."
+        )
 
 unparsed = queries.wholesale_unparsed_dates()
 if unparsed and (start is not None or end is not None):
@@ -176,6 +219,9 @@ summary = queries.basket_summary(
     chosen_product_bs,
     sku,
     size,
+    section,
+    aspect,
+    rim,
     brand,
     name,
     start,
@@ -184,6 +230,8 @@ summary = queries.basket_summary(
     wholesale_max,
     include_outside,
     outside_only,
+    grade,
+    treads=chosen_treads,
 )
 sku_col, stock_col, wholesale_col = st.columns(3)
 sku_col.metric("SKUs", "{:,}".format(summary["sku_count"]))
@@ -205,11 +253,11 @@ if summary["unmatched_rows"]:
     )
 
 st.subheader("Grouped")
-if outside_only and group_by == "basket":
+if outside_only and group_by == "Basket":
     st.caption("These SKUs are not in this week's tracking report, so they sit in (no basket).")
 elif outside_only:
     st.caption("Wholesale counts each tire once. These SKUs are not in this week's tracking report and have no stock.")
-elif group_by == "basket":
+elif group_by == "Basket":
     st.caption(
         "Stock is summed inside each basket. "
         "A wholesale sale is counted in every selected basket that contains its SKU."
@@ -235,6 +283,9 @@ st.dataframe(
         chosen_product_bs,
         sku,
         size,
+        section,
+        aspect,
+        rim,
         brand,
         name,
         group_by,
@@ -244,6 +295,8 @@ st.dataframe(
         wholesale_max,
         include_outside,
         outside_only,
+        grade,
+        treads=chosen_treads,
     ),
     hide_index=True,
     width="stretch",
@@ -261,6 +314,9 @@ row_args = (
     chosen_product_bs,
     sku,
     size,
+    section,
+    aspect,
+    rim,
     brand,
     name,
 )
@@ -273,6 +329,8 @@ visible = queries.basket_rows(
     wholesale_max=wholesale_max,
     include_outside=include_outside,
     outside_only=outside_only,
+    grade=grade,
+    treads=chosen_treads,
 )
 if total_rows > DISPLAY_LIMIT:
     st.caption("Showing the first {limit:,} of {total:,} rows.".format(limit=DISPLAY_LIMIT, total=total_rows))
@@ -297,6 +355,8 @@ full_rows = (
         wholesale_max=wholesale_max,
         include_outside=include_outside,
         outside_only=outside_only,
+        grade=grade,
+        treads=chosen_treads,
     )
 )
 st.download_button(

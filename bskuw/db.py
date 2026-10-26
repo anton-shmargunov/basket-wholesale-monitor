@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS tracking (
     product_bs VARCHAR,
     sku VARCHAR,
     stock_qty_w DOUBLE,
-    source_file VARCHAR
+    source_file VARCHAR,
+    grade VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS sku_dim (
@@ -28,6 +29,9 @@ CREATE TABLE IF NOT EXISTS sku_dim (
     brand VARCHAR,
     model VARCHAR,
     size VARCHAR,
+    section VARCHAR,
+    aspect VARCHAR,
+    rim VARCHAR,
     tread VARCHAR,
     condition VARCHAR,
     internal_category VARCHAR,
@@ -39,7 +43,8 @@ CREATE TABLE IF NOT EXISTS wholesale (
     sku VARCHAR,
     sale_date DATE,
     sale_number VARCHAR,
-    source_file VARCHAR
+    source_file VARCHAR,
+    majority VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS quant_report (
@@ -53,7 +58,8 @@ CREATE TABLE wholesale (
     sku VARCHAR,
     sale_date DATE,
     sale_number VARCHAR,
-    source_file VARCHAR
+    source_file VARCHAR,
+    majority VARCHAR
 )
 """
 
@@ -71,14 +77,19 @@ CREATE OR REPLACE MACRO parse_sale_date(text) AS
 CAST(
     COALESCE(
         TRY_STRPTIME(text, '%Y-%m-%d'),
+        TRY_STRPTIME(text, '%Y-%m-%d %H:%M:%S.%f'),
         TRY_STRPTIME(text, '%Y-%m-%d %H:%M:%S'),
+        TRY_STRPTIME(text, '%Y-%m-%d %H:%M'),
         TRY_STRPTIME(text, '%d/%m/%Y'),
+        TRY_STRPTIME(text, '%d/%m/%Y %H:%M:%S.%f'),
         TRY_STRPTIME(text, '%d/%m/%Y %H:%M:%S'),
         TRY_STRPTIME(text, '%d.%m.%Y'),
+        TRY_STRPTIME(text, '%d.%m.%Y %H:%M:%S.%f'),
         TRY_STRPTIME(text, '%d.%m.%Y %H:%M:%S'),
         TRY_STRPTIME(text, '%d-%m-%Y'),
         TRY_STRPTIME(text, '%Y/%m/%d'),
         TRY_STRPTIME(text, '%m/%d/%Y'),
+        TRY_STRPTIME(text, '%m/%d/%Y %H:%M:%S.%f'),
         TRY_STRPTIME(text, '%m/%d/%Y %H:%M:%S')
     ) AS DATE
 )
@@ -99,6 +110,8 @@ def get_connection():
                     raise
                 wal.unlink()
                 _CONNECTION = _open_database(DB_PATH)
+        _ensure_sku_columns(_CONNECTION)
+        _ensure_grade_columns(_CONNECTION)
         return _CONNECTION
 
 
@@ -284,12 +297,31 @@ def _quote_ident(name):
     return '"{name}"'.format(name=name.replace('"', '""'))
 
 
+def _ensure_sku_columns(connection):
+    columns = [row[0] for row in connection.execute("DESCRIBE sku_dim").fetchall()]
+    for name in ("section", "aspect", "rim"):
+        if name not in columns:
+            connection.execute("ALTER TABLE sku_dim ADD COLUMN {name} VARCHAR".format(name=name))
+
+
+def _ensure_grade_columns(connection):
+    """Add tracking grade and per-sale Majority on databases created before them."""
+    tracking_columns = [row[0] for row in connection.execute("DESCRIBE tracking").fetchall()]
+    if "grade" not in tracking_columns:
+        connection.execute("ALTER TABLE tracking ADD COLUMN grade VARCHAR")
+    columns = [row[0] for row in connection.execute("DESCRIBE wholesale").fetchall()]
+    if "sale_date" in columns and "majority" not in columns:
+        connection.execute("ALTER TABLE wholesale ADD COLUMN majority VARCHAR")
+
+
 def _ensure_schema(connection):
     connection.execute(_SCHEMA)
+    _ensure_sku_columns(connection)
     columns = [row[0] for row in connection.execute("DESCRIBE wholesale").fetchall()]
     if "sale_date" not in columns:
         connection.execute("DROP TABLE wholesale")
         connection.execute(_WHOLESALE_TABLE)
+    _ensure_grade_columns(connection)
     connection.execute(_INDEXES)
     connection.execute(_PARSE_MACRO)
 

@@ -61,7 +61,10 @@ if st.button("Use this database", disabled=database_upload is None):
         st.error(str(exc))
 
 st.subheader("Tracking basket report")
-st.caption("xlsx or csv, about 5 MB. A new file replaces the weeks it contains. An upload is used instead of the path.")
+st.caption(
+    "xlsx or csv, about 5 MB. A new file replaces the weeks it contains. An upload is used instead of the path. "
+    "Grade is kept when the file has that column. One SKU can be grade A and grade B."
+)
 tracking_upload = st.file_uploader("Upload a tracking export", type=["xlsx", "csv"])
 tracking_path = st.text_input("Or tracking file path", key="data_tracking_path")
 if st.button("Load tracking", type="primary"):
@@ -83,7 +86,8 @@ st.subheader("Quant report")
 st.caption(
     "CSV, about 2 GB. Paste a path. The uploader is not used because the file is larger than Streamlit's upload limit. "
     "This replaces the SKU attribute table and the wholesale sales. "
-    "A wholesale sale is a tire at {location} with a sales order date and number.".format(
+    "A wholesale sale is a tire at {location}. "
+    "Each SKU keeps Tread. Each sale keeps its Majority, which is how Grade A and Grade B split wholesale.".format(
         location=ingest.WHOLESALE_LOCATION
     )
 )
@@ -96,7 +100,7 @@ if st.button("Load quant"):
         last_date = result["last_sale_date"]
         last_text = last_date.isoformat()[:10] if last_date is not None else "none"
         st.success(
-            "Loaded {rows:,} SKUs and {wholesale:,} wholesale sales. Last sales order date: {last}.".format(
+            "Loaded {rows:,} SKUs and {wholesale:,} wholesale sales. Last incoming date to saleable location: {last}.".format(
                 rows=result["rows"],
                 wholesale=result["wholesale_rows"],
                 last=last_text,

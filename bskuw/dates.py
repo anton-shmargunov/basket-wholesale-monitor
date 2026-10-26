@@ -1,10 +1,11 @@
-"""Sales-order date presets for Basket SKUs and Wholesale."""
+"""Incoming-date presets for Basket SKUs and Wholesale."""
 
 from datetime import date, datetime, timedelta
 
 PRESETS = ("empty", "last week", "last month", "last year")
+DATE_LABEL = "Incoming date to saleable location"
 
-# Inclusive lengths. The end date is the quant report's last sales-order date,
+# Inclusive lengths. The end date is the latest incoming date in the quant report,
 # so the start is 6, 29, or 364 days earlier.
 _PRESET_DAYS_BEFORE = {
     "last week": 6,
@@ -33,12 +34,12 @@ def describe_range(start, end):
     if start is not None and end is not None and start > end:
         return "Start is after end."
     if start is None and end is None:
-        return "Sales order date: any date."
+        return "{label}: any date.".format(label=DATE_LABEL)
     if start is None:
-        return "Sales order date: through {end}.".format(end=end.isoformat())
+        return "{label}: through {end}.".format(label=DATE_LABEL, end=end.isoformat())
     if end is None:
-        return "Sales order date: from {start}.".format(start=start.isoformat())
-    return "Sales order date: {start} to {end}.".format(start=start.isoformat(), end=end.isoformat())
+        return "{label}: from {start}.".format(label=DATE_LABEL, start=start.isoformat())
+    return "{label}: {start} to {end}.".format(label=DATE_LABEL, start=start.isoformat(), end=end.isoformat())
 
 
 def _as_date(value):

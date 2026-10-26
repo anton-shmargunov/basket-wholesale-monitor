@@ -3,12 +3,33 @@
 StockQty_W is a snapshot for one week. Callers pass a single week and may sum
 stock across baskets. A wholesale sale does not carry a basket: it counts for
 a basket when its SKU is in that basket in the selected week. Each stored
-wholesale row is one sold tire.
+wholesale row is one sold tire. Majority decides that tire's grade. The sale
+counts for that grade even when the tracking snapshot has stock only for
+another grade of the same SKU.
 """
 
 from bskuw import db
 
-WHOLESALE_GROUPS = ("SKU", "size", "brand", "name", "basket")
+GRADE_OPTIONS = ("", "A", "B")
+GRADE_HELP = (
+    "Empty includes every grade. "
+    "A counts Majority No Repair and Minor Repair. "
+    "B counts Major Repair and Close to Sidewall. "
+    "One SKU can have both grades. "
+    "A grade still counts when that grade has no stock."
+)
+
+WHOLESALE_GROUPS = (
+    "SKU",
+    "Size",
+    "Section",
+    "Aspect",
+    "Rim",
+    "Section-Aspect-Rim",
+    "Brand",
+    "Name",
+    "Basket",
+)
 
 _WEEK_ORDER = """
 ORDER BY
@@ -16,6 +37,232 @@ ORDER BY
     TRY_CAST(split_part(year_week, '-', 2) AS INTEGER) DESC,
     year_week DESC
 """
+
+
+def _filled(column, label):
+    """Blank text becomes a visible group such as (no section)."""
+    return "coalesce(nullif(trim({column}), ''), '(no {label})')".format(column=column, label=label)
+
+
+def _group_key(group_by, sku, size, section, aspect, rim, brand, name):
+    """Return the grouping expression and its column label."""
+    section_text = _filled(section, "section")
+    aspect_text = _filled(aspect, "aspect")
+    rim_text = _filled(rim, "rim")
+    keys = {
+        "SKU": (_filled(sku, "SKU"), "SKU"),
+        "Size": (_filled(size, "size"), "Size"),
+        "Section": (section_text, "Section"),
+        "Aspect": (aspect_text, "Aspect"),
+        "Rim": (rim_text, "Rim"),
+        "Section-Aspect-Rim": (
+            "{section} || '-' || {aspect} || '-' || {rim}".format(
+                section=section_text, aspect=aspect_text, rim=rim_text
+            ),
+            "Section-Aspect-Rim",
+        ),
+        "Brand": (_filled(brand, "brand"), "Brand"),
+        "Name": (_filled(name, "name"), "Name"),
+    }
+    return keys[group_by]
+
+
+def _dimension_columns(section, aspect, rim, label):
+    """Section, Aspect, and Rim columns for groups where each value is unique.
+
+    Grouping by only one of them leaves the other two out, because one Section
+    contains many Aspects and Rims.
+    """
+    if label in ("Section", "Aspect", "Rim"):
+        return ""
+    columns = [
+        'mode({column}) AS "Section"'.format(column=section),
+        'mode({column}) AS "Aspect"'.format(column=aspect),
+        'mode({column}) AS "Rim"'.format(column=rim),
+    ]
+    return ",\n            ".join(columns) + ","
+
+
+def _clean_grade(grade):
+    if grade is None:
+        return None
+    text = str(grade).strip().upper()
+    if text in ("A", "B"):
+        return text
+    return None
+
+
+def _sale_grade_expr(column):
+    """Map a quant Majority value to tracking grade A or B."""
+    return (
+        "CASE"
+        " WHEN trim(coalesce({column}, '')) IN ('No Repair', 'Minor Repair') THEN 'A'"
+        " WHEN trim(coalesce({column}, '')) IN ('Major Repair', 'Close to Sidewall') THEN 'B'"
+        " ELSE NULL END"
+    ).format(column=column)
+
+
+def _sale_grade_clause(grade, column):
+    value = _clean_grade(grade)
+    if not value:
+        return "TRUE"
+    return "{expr} = '{value}'".format(expr=_sale_grade_expr(column), value=value)
+
+
+def _tracking_grade_clause(grade, column="t.grade"):
+    value = _clean_grade(grade)
+    if not value:
+        return "TRUE"
+    return "trim(coalesce({column}, '')) = '{value}'".format(column=column, value=value)
+
+
+def _sold_sql(date_where, grade, majority_column="majority"):
+    return """
+            SELECT
+                sku,
+                {expr} AS sale_grade,
+                count(*) AS sold
+            FROM wholesale
+            WHERE {date_where} AND {grade_where}
+            GROUP BY 1, 2
+    """.format(
+        expr=_sale_grade_expr(majority_column),
+        date_where=date_where or "TRUE",
+        grade_where=_sale_grade_clause(grade, majority_column),
+    )
+
+
+def _stored_grade_clause(grade, column):
+    """Keep one stored grade. Empty grade keeps every stored grade."""
+    value = _clean_grade(grade)
+    if not value:
+        return "TRUE"
+    return "{column} = '{value}'".format(column=column, value=value)
+
+
+def _graded_ctes(member_where, date_where, grade):
+    """Stock rows by tracking grade, plus sales of a grade that has no stock.
+
+    present is every tracking grade in the selected baskets. sold is wholesale
+    by Majority. extra is a stock-0 row for a Majority grade the basket does
+    not already list for that SKU.
+    """
+    return """
+        sold AS (
+            {sold_sql}
+        ),
+        present AS (
+            SELECT
+                t.basket,
+                t.sku,
+                coalesce(nullif(trim(t.grade), ''), '') AS grade,
+                any_value(t.product_bs) AS product_bs,
+                any_value(d.size) AS size,
+                any_value(d.section) AS section,
+                any_value(d.aspect) AS aspect,
+                any_value(d.rim) AS rim,
+                any_value(d.brand) AS brand,
+                any_value(d.name) AS name,
+                any_value(d.model) AS model,
+                any_value(d.tread) AS tread,
+                any_value(d.condition) AS condition,
+                any_value(d.sku) AS dim_sku,
+                sum(t.stock_qty_w) AS stock
+            FROM tracking t
+            LEFT JOIN sku_dim d ON t.sku = d.sku
+            WHERE {member_where}
+            GROUP BY t.basket, t.sku, coalesce(nullif(trim(t.grade), ''), '')
+        ),
+        extra AS (
+            SELECT
+                p.basket,
+                p.sku,
+                coalesce(s.sale_grade, '') AS grade,
+                any_value(p.product_bs) AS product_bs,
+                any_value(p.size) AS size,
+                any_value(p.section) AS section,
+                any_value(p.aspect) AS aspect,
+                any_value(p.rim) AS rim,
+                any_value(p.brand) AS brand,
+                any_value(p.name) AS name,
+                any_value(p.model) AS model,
+                any_value(p.tread) AS tread,
+                any_value(p.condition) AS condition,
+                any_value(p.dim_sku) AS dim_sku,
+                CAST(0 AS DOUBLE) AS stock,
+                any_value(s.sold) AS sold
+            FROM present p
+            JOIN sold s ON s.sku = p.sku
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM present g
+                WHERE g.basket = p.basket
+                  AND g.sku = p.sku
+                  AND g.grade = coalesce(s.sale_grade, '')
+            )
+            GROUP BY p.basket, p.sku, coalesce(s.sale_grade, '')
+        ),
+        graded AS (
+            SELECT
+                p.basket,
+                p.sku,
+                p.grade,
+                p.product_bs,
+                p.size,
+                p.section,
+                p.aspect,
+                p.rim,
+                p.brand,
+                p.name,
+                p.model,
+                p.tread,
+                p.condition,
+                p.dim_sku,
+                p.stock,
+                coalesce(s.sold, 0) AS sold
+            FROM present p
+            LEFT JOIN sold s
+                ON s.sku = p.sku
+               AND coalesce(s.sale_grade, '') = p.grade
+            WHERE {stored_grade}
+            UNION ALL
+            SELECT
+                e.basket,
+                e.sku,
+                e.grade,
+                e.product_bs,
+                e.size,
+                e.section,
+                e.aspect,
+                e.rim,
+                e.brand,
+                e.name,
+                e.model,
+                e.tread,
+                e.condition,
+                e.dim_sku,
+                e.stock,
+                e.sold
+            FROM extra e
+            WHERE {extra_grade}
+        )
+    """.format(
+        sold_sql=_sold_sql(date_where, grade),
+        member_where=member_where,
+        stored_grade=_stored_grade_clause(grade, "p.grade"),
+        extra_grade=_stored_grade_clause(grade, "e.grade"),
+    )
+
+
+def grade_data_loaded():
+    """How many tracking rows have a grade, and how many sales have a Majority."""
+    tracking = db.fetch_one(
+        "SELECT count(*) FROM tracking WHERE nullif(trim(grade), '') IS NOT NULL"
+    )[0]
+    sales = db.fetch_one(
+        "SELECT count(*) FROM wholesale WHERE nullif(trim(majority), '') IS NOT NULL"
+    )[0]
+    return {"tracking": tracking, "wholesale": sales}
 
 
 def status():
@@ -107,12 +354,31 @@ def list_product_bs(year_week):
     return [row[0] for row in rows]
 
 
+def list_treads():
+    """Tread values kept from the quant report.
+
+    The number before the slash orders 4/32 before 4.5/32.
+    """
+    rows = db.fetchall(
+        """
+        SELECT DISTINCT trim(tread) AS tread
+        FROM sku_dim
+        WHERE nullif(trim(tread), '') IS NOT NULL
+        ORDER BY TRY_CAST(split_part(trim(tread), '/', 1) AS DOUBLE), tread
+        """
+    )[1]
+    return [row[0] for row in rows]
+
+
 def basket_summary(
     year_week,
     baskets,
     product_bs,
     sku,
     size,
+    section,
+    aspect,
+    rim,
     brand,
     name,
     start=None,
@@ -121,14 +387,18 @@ def basket_summary(
     wholesale_max=None,
     include_outside=False,
     outside_only=False,
+    grade=None,
+    treads=None,
 ):
     if outside_only:
         return _outside_only_summary(
-            year_week, baskets, product_bs, sku, size, brand, name, start, end, wholesale_min, wholesale_max
+            year_week, baskets, product_bs, sku, size, section, aspect, rim, brand, name, start, end, wholesale_min, wholesale_max, grade, treads
         )
-    where, filter_params = _tracking_filters(year_week, baskets, product_bs, sku, size, brand, name)
+    where, filter_params = _tracking_filters(
+        year_week, baskets, product_bs, sku, size, section, aspect, rim, brand, name, grade=None, treads=treads
+    )
     date_sql, date_params = _sale_date_sql(start, end, column="sale_date")
-    bound_sql, bound_params = _count_bounds(wholesale_min, wholesale_max, "coalesce(ws.sold, 0)")
+    bound_sql, bound_params = _count_bounds(wholesale_min, wholesale_max, "sold")
     outside_sql, outside_params = _outside_union(
         include_outside,
         product_bs,
@@ -136,11 +406,15 @@ def basket_summary(
         baskets,
         sku,
         size,
+        section,
+        aspect,
+        rim,
         brand,
         name,
         wholesale_min,
         wholesale_max,
-        """
+        treads=treads,
+        wrapper="""
         SELECT
             outside_skus.sku,
             outside_skus.size,
@@ -156,26 +430,22 @@ def basket_summary(
     params = list(date_params) + list(filter_params) + list(bound_params) + list(outside_params)
     return db.fetch_dicts(
         """
-        WITH sold AS (
-            SELECT sku, count(*) AS sold
-            FROM wholesale
-            WHERE {date_where}
-            GROUP BY sku
-        ),
+        WITH {graded_ctes},
         rows AS (
             SELECT
-                t.sku,
-                d.size,
-                d.brand,
-                d.name,
-                d.sku AS dim_sku,
-                t.stock_qty_w,
-                coalesce(ws.sold, 0) AS sold,
-                row_number() OVER (PARTITION BY t.sku ORDER BY t.basket) AS sku_row
-            FROM tracking t
-            LEFT JOIN sku_dim d ON t.sku = d.sku
-            LEFT JOIN sold ws ON t.sku = ws.sku
-            WHERE {where} AND {bounds}
+                sku,
+                size,
+                brand,
+                name,
+                dim_sku,
+                stock AS stock_qty_w,
+                sold,
+                row_number() OVER (
+                    PARTITION BY sku, grade
+                    ORDER BY basket
+                ) AS sku_row
+            FROM graded
+            WHERE {bounds}
             {outside_sql}
         )
         SELECT
@@ -189,8 +459,7 @@ def basket_summary(
             count(*) FILTER (WHERE dim_sku IS NULL) AS unmatched_rows
         FROM rows
         """.format(
-            date_where=date_sql or "TRUE",
-            where=where,
+            graded_ctes=_graded_ctes(where, date_sql, grade),
             bounds=bound_sql,
             outside_sql=outside_sql,
         ),
@@ -204,6 +473,9 @@ def basket_rows(
     product_bs,
     sku,
     size,
+    section,
+    aspect,
+    rim,
     brand,
     name,
     limit=None,
@@ -213,6 +485,8 @@ def basket_rows(
     wholesale_max=None,
     include_outside=False,
     outside_only=False,
+    grade=None,
+    treads=None,
 ):
     if outside_only:
         return _outside_only_rows(
@@ -221,6 +495,9 @@ def basket_rows(
             product_bs,
             sku,
             size,
+            section,
+            aspect,
+            rim,
             brand,
             name,
             start,
@@ -228,10 +505,14 @@ def basket_rows(
             wholesale_min,
             wholesale_max,
             limit,
+            grade,
+            treads,
         )
-    where, filter_params = _tracking_filters(year_week, baskets, product_bs, sku, size, brand, name)
+    where, filter_params = _tracking_filters(
+        year_week, baskets, product_bs, sku, size, section, aspect, rim, brand, name, grade=None, treads=treads
+    )
     date_sql, date_params = _sale_date_sql(start, end, column="sale_date")
-    bound_sql, bound_params = _count_bounds(wholesale_min, wholesale_max, "coalesce(ws.sold, 0)")
+    bound_sql, bound_params = _count_bounds(wholesale_min, wholesale_max, "sold")
     outside_sql, outside_params = _outside_union(
         include_outside,
         product_bs,
@@ -239,15 +520,23 @@ def basket_rows(
         baskets,
         sku,
         size,
+        section,
+        aspect,
+        rim,
         brand,
         name,
         wholesale_min,
         wholesale_max,
-        """
+        treads=treads,
+        wrapper="""
         SELECT
             '(no basket)' AS "Basket",
             outside_skus.sku AS "SKU",
+            outside_skus.sale_grade AS "Grade",
             outside_skus.size AS "Size",
+            outside_skus.section AS "Section",
+            outside_skus.aspect AS "Aspect",
+            outside_skus.rim AS "Rim",
             outside_skus.brand AS "Brand",
             outside_skus.name AS "Name",
             outside_skus.model AS "Model",
@@ -266,30 +555,27 @@ def basket_rows(
         params.append(int(limit))
     return db.fetch_dicts(
         """
-        WITH sold AS (
-            SELECT sku, count(*) AS sold
-            FROM wholesale
-            WHERE {date_where}
-            GROUP BY sku
-        )
+        WITH {graded_ctes}
         SELECT *
         FROM (
             SELECT
-                t.basket AS "Basket",
-                t.sku AS "SKU",
-                d.size AS "Size",
-                d.brand AS "Brand",
-                d.name AS "Name",
-                d.model AS "Model",
-                d.tread AS "Tread",
-                d.condition AS "Condition",
-                t.product_bs AS "Product BS",
-                t.stock_qty_w AS "Stock",
-                coalesce(ws.sold, 0) AS "Wholesale"
-            FROM tracking t
-            LEFT JOIN sku_dim d ON t.sku = d.sku
-            LEFT JOIN sold ws ON t.sku = ws.sku
-            WHERE {where} AND {bounds}
+                basket AS "Basket",
+                sku AS "SKU",
+                nullif(grade, '') AS "Grade",
+                size AS "Size",
+                section AS "Section",
+                aspect AS "Aspect",
+                rim AS "Rim",
+                brand AS "Brand",
+                name AS "Name",
+                model AS "Model",
+                tread AS "Tread",
+                condition AS "Condition",
+                product_bs AS "Product BS",
+                stock AS "Stock",
+                sold AS "Wholesale"
+            FROM graded
+            WHERE {bounds}
             {outside_sql}
         ) combined
         ORDER BY
@@ -297,11 +583,11 @@ def basket_rows(
             TRY_CAST("Basket" AS INTEGER),
             "Basket",
             "Size",
-            "SKU"
+            "SKU",
+            "Grade"
         {limit_sql}
         """.format(
-            date_where=date_sql or "TRUE",
-            where=where,
+            graded_ctes=_graded_ctes(where, date_sql, grade),
             bounds=bound_sql,
             outside_sql=outside_sql,
             limit_sql=limit_sql,
@@ -316,6 +602,9 @@ def basket_grouped(
     product_bs,
     sku,
     size,
+    section,
+    aspect,
+    rim,
     brand,
     name,
     group_by,
@@ -325,12 +614,15 @@ def basket_grouped(
     wholesale_max=None,
     include_outside=False,
     outside_only=False,
+    grade=None,
+    treads=None,
 ):
     """Stock and wholesale for one grouping.
 
     Wholesale min and max keep SKUs whose own wholesale count is inside the
-    range, and both totals use only those SKUs. Grouping by size, brand, name,
-    or SKU counts each tire once. Grouping by basket counts a tire in every
+    range, and both totals use only those SKUs. Grouping by size, section, aspect,
+    rim, the section-aspect-rim combination, brand, name, or SKU counts each tire once.
+    Grouping by basket counts a tire in every
     selected basket that contains its SKU. Stock is summed across the tracking
     rows that remain.
     """
@@ -342,6 +634,9 @@ def basket_grouped(
         product_bs,
         sku,
         size,
+        section,
+        aspect,
+        rim,
         brand,
         name,
         start,
@@ -350,11 +645,16 @@ def basket_grouped(
         wholesale_max,
         include_outside,
         outside_only,
+        grade,
+        treads,
     )
-    if group_by == "basket":
+    if group_by == "Basket":
         body = """
         SELECT
             basket AS "Basket",
+            mode(section) AS "Section",
+            mode(aspect) AS "Aspect",
+            mode(rim) AS "Rim",
             count(DISTINCT sku) AS "SKUs",
             coalesce(sum(stock), 0) AS "Stock",
             coalesce(sum(sold), 0) AS "Wholesale"
@@ -368,11 +668,20 @@ def basket_grouped(
             basket
         """
     else:
-        column = {"SKU": "sku", "size": "size", "brand": "brand", "name": "name"}[group_by]
-        label = {"SKU": "SKU", "size": "Size", "brand": "Brand", "name": "Name"}[group_by]
+        column, label = _group_key(
+            group_by,
+            sku="sku",
+            size="size",
+            section="section",
+            aspect="aspect",
+            rim="rim",
+            brand="brand",
+            name="name",
+        )
         body = """
         SELECT
             {column} AS "{label}",
+            {dimensions}
             count(*) AS "SKUs",
             coalesce(sum(stock), 0) AS "Stock",
             coalesce(sum(sold), 0) AS "Wholesale"
@@ -380,16 +689,37 @@ def basket_grouped(
             SELECT
                 sku,
                 any_value(size) AS size,
+                any_value(section) AS section,
+                any_value(aspect) AS aspect,
+                any_value(rim) AS rim,
                 any_value(brand) AS brand,
                 any_value(name) AS name,
                 sum(stock) AS stock,
-                max(sold) AS sold
-            FROM filtered
+                sum(sold) AS sold
+            FROM (
+                SELECT
+                    sku,
+                    grade,
+                    any_value(size) AS size,
+                    any_value(section) AS section,
+                    any_value(aspect) AS aspect,
+                    any_value(rim) AS rim,
+                    any_value(brand) AS brand,
+                    any_value(name) AS name,
+                    sum(stock) AS stock,
+                    max(sold) AS sold
+                FROM filtered
+                GROUP BY sku, grade
+            ) per_grade
             GROUP BY sku
         ) sku_level
         GROUP BY {column}
         ORDER BY "Stock" DESC, "Wholesale" DESC, "{label}"
-        """.format(column=column, label=label)
+        """.format(
+            column=column,
+            label=label,
+            dimensions=_dimension_columns("section", "aspect", "rim", label),
+        )
     return db.fetch_dicts(head + body, params)
 
 
@@ -397,9 +727,9 @@ def wholesale_unparsed_dates():
     return db.fetch_one("SELECT count(*) FROM wholesale WHERE sale_date IS NULL")[0]
 
 
-def wholesale_count(year_week, baskets, sku, size, brand, name, start, end):
+def wholesale_count(year_week, baskets, sku, size, section, aspect, rim, brand, name, start, end, grade=None, treads=None):
     """Count sold wholesale tires once, even when a SKU sits in several baskets."""
-    where, params = _wholesale_where(year_week, baskets, sku, size, brand, name, start, end)
+    where, params = _wholesale_where(year_week, baskets, sku, size, section, aspect, rim, brand, name, start, end, grade, treads)
     return db.fetch_one(
         """
         SELECT count(*)
@@ -411,60 +741,74 @@ def wholesale_count(year_week, baskets, sku, size, brand, name, start, end):
     )[0]
 
 
-def wholesale_summary(year_week, baskets, sku, size, brand, name, group_by, start, end):
+def wholesale_summary(year_week, baskets, sku, size, section, aspect, rim, brand, name, group_by, start, end, grade=None, treads=None):
     """Count sold wholesale tires.
 
     Grouping by basket counts a tire in every selected basket that contains its
-    SKU. Grouping by SKU, size, brand, or name counts each tire once.
+    SKU. Every other grouping counts each tire once.
     start and end are inclusive. None means that side is unlimited.
     """
     if group_by not in WHOLESALE_GROUPS:
         raise ValueError("Unknown grouping: {group}".format(group=group_by))
 
-    if group_by == "basket":
-        sku_where, sku_params = _sku_membership_filters(year_week, baskets, sku, size, brand, name)
+    if group_by == "Basket":
+        sku_where, sku_params = _sku_membership_filters(year_week, baskets, sku, size, section, aspect, rim, brand, name, grade, treads)
         date_sql, date_params = _sale_date_sql(start, end)
         return db.fetch_dicts(
             """
             WITH members AS (
-                SELECT DISTINCT t.sku, t.basket
+                SELECT DISTINCT t.sku, t.basket, d.section, d.aspect, d.rim
                 FROM tracking t
                 LEFT JOIN sku_dim d ON t.sku = d.sku
                 WHERE {sku_where}
             )
             SELECT
                 m.basket AS "Basket",
+                mode(m.section) AS "Section",
+                mode(m.aspect) AS "Aspect",
+                mode(m.rim) AS "Rim",
                 count(*) AS "Sold"
             FROM wholesale w
             INNER JOIN members m ON w.sku = m.sku
-            WHERE {date_where}
+            WHERE {date_where} AND {sale_grade}
             GROUP BY m.basket
             ORDER BY "Sold" DESC, m.basket
             """.format(
                 sku_where=sku_where,
                 date_where=date_sql or "TRUE",
+                sale_grade=_sale_grade_clause(grade, "w.majority"),
             ),
             list(sku_params) + list(date_params),
         )
 
-    expressions = {
-        "SKU": 'coalesce(w.sku, \'(no SKU)\') AS "SKU"',
-        "size": 'coalesce(nullif(d.size, \'\'), \'(no size)\') AS "Size"',
-        "brand": 'coalesce(nullif(d.brand, \'\'), \'(no brand)\') AS "Brand"',
-        "name": 'coalesce(nullif(d.name, \'\'), \'(no name)\') AS "Name"',
-    }
-    where, params = _wholesale_where(year_week, baskets, sku, size, brand, name, start, end)
+    column, label = _group_key(
+        group_by,
+        sku="w.sku",
+        size="d.size",
+        section="d.section",
+        aspect="d.aspect",
+        rim="d.rim",
+        brand="d.brand",
+        name="d.name",
+    )
+    where, params = _wholesale_where(year_week, baskets, sku, size, section, aspect, rim, brand, name, start, end, grade, treads)
     return db.fetch_dicts(
         """
         SELECT
-            {expression},
+            {column} AS "{label}",
+            {dimensions}
             count(*) AS "Sold"
         FROM wholesale w
         LEFT JOIN sku_dim d ON w.sku = d.sku
         WHERE {where}
         GROUP BY 1
         ORDER BY "Sold" DESC
-        """.format(expression=expressions[group_by], where=where),
+        """.format(
+            column=column,
+            label=label,
+            dimensions=_dimension_columns("d.section", "d.aspect", "d.rim", label),
+            where=where,
+        ),
         params,
     )
 
@@ -475,6 +819,9 @@ def _filtered_members_sql(
     product_bs,
     sku,
     size,
+    section,
+    aspect,
+    rim,
     brand,
     name,
     start,
@@ -483,14 +830,18 @@ def _filtered_members_sql(
     wholesale_max,
     include_outside=False,
     outside_only=False,
+    grade=None,
+    treads=None,
 ):
     if outside_only:
         return _outside_only_members_sql(
-            year_week, baskets, product_bs, sku, size, brand, name, start, end, wholesale_min, wholesale_max
+            year_week, baskets, product_bs, sku, size, section, aspect, rim, brand, name, start, end, wholesale_min, wholesale_max, grade, treads
         )
-    where, filter_params = _tracking_filters(year_week, baskets, product_bs, sku, size, brand, name)
+    where, filter_params = _tracking_filters(
+        year_week, baskets, product_bs, sku, size, section, aspect, rim, brand, name, grade=None, treads=treads
+    )
     date_sql, date_params = _sale_date_sql(start, end, column="sale_date")
-    bound_sql, bound_params = _count_bounds(wholesale_min, wholesale_max, "coalesce(s.sold, 0)")
+    bound_sql, bound_params = _count_bounds(wholesale_min, wholesale_max, "g.sold")
     outside_sql, outside_params = _outside_union(
         include_outside,
         product_bs,
@@ -498,68 +849,55 @@ def _filtered_members_sql(
         baskets,
         sku,
         size,
+        section,
+        aspect,
+        rim,
         brand,
         name,
         wholesale_min,
         wholesale_max,
-        """
+        treads=treads,
+        wrapper="""
         SELECT
             '(no basket)' AS basket,
             outside_skus.sku,
+            coalesce(outside_skus.sale_grade, '') AS grade,
             coalesce(nullif(outside_skus.size, ''), '(no size)') AS size,
+            outside_skus.section,
+            outside_skus.aspect,
+            outside_skus.rim,
             coalesce(nullif(outside_skus.brand, ''), '(no brand)') AS brand,
             coalesce(nullif(outside_skus.name, ''), '(no name)') AS name,
             CAST(0 AS DOUBLE) AS stock,
-            outside_skus.sold
+            outside_skus.sold AS sold
         FROM ({outside_select}) outside_skus
         """,
     )
     sql = """
-        WITH member AS (
-            SELECT
-                t.basket,
-                t.sku,
-                coalesce(nullif(d.size, ''), '(no size)') AS size,
-                coalesce(nullif(d.brand, ''), '(no brand)') AS brand,
-                coalesce(nullif(d.name, ''), '(no name)') AS name,
-                sum(t.stock_qty_w) AS stock
-            FROM tracking t
-            LEFT JOIN sku_dim d ON t.sku = d.sku
-            WHERE {where}
-            GROUP BY
-                t.basket,
-                t.sku,
-                coalesce(nullif(d.size, ''), '(no size)'),
-                coalesce(nullif(d.brand, ''), '(no brand)'),
-                coalesce(nullif(d.name, ''), '(no name)')
-        ),
-        sold AS (
-            SELECT sku, count(*) AS sold
-            FROM wholesale
-            WHERE {date_where}
-            GROUP BY sku
-        ),
+        WITH {graded_ctes},
         filtered AS (
             SELECT
-                m.basket,
-                m.sku,
-                m.size,
-                m.brand,
-                m.name,
-                m.stock,
-                coalesce(s.sold, 0) AS sold
-            FROM member m
-            LEFT JOIN sold s ON m.sku = s.sku
+                g.basket,
+                g.sku,
+                g.grade,
+                coalesce(nullif(g.size, ''), '(no size)') AS size,
+                g.section,
+                g.aspect,
+                g.rim,
+                coalesce(nullif(g.brand, ''), '(no brand)') AS brand,
+                coalesce(nullif(g.name, ''), '(no name)') AS name,
+                g.stock,
+                g.sold
+            FROM graded g
             WHERE {bounds}
             {outside_sql}
         )
     """.format(
-        where=where,
-        date_where=date_sql or "TRUE",
+        graded_ctes=_graded_ctes(where, date_sql, grade),
         bounds=bound_sql,
         outside_sql=outside_sql,
     )
-    return sql, list(filter_params) + list(date_params) + list(bound_params) + list(outside_params)
+    return sql, list(date_params) + list(filter_params) + list(bound_params) + list(outside_params)
 
 
 def _empty_basket_summary():
@@ -576,21 +914,18 @@ def _empty_basket_summary():
 
 
 def _outside_only_summary(
-    year_week, baskets, product_bs, sku, size, brand, name, start, end, wholesale_min, wholesale_max
+    year_week, baskets, product_bs, sku, size, section, aspect, rim, brand, name, start, end, wholesale_min, wholesale_max, grade=None, treads=None
 ):
     if product_bs:
         return _empty_basket_summary()
     date_sql, date_params = _sale_date_sql(start, end, column="sale_date")
     outside_select, outside_params = _outside_skus_sql(
-        year_week, baskets, sku, size, brand, name, wholesale_min, wholesale_max
+        year_week, baskets, sku, size, section, aspect, rim, brand, name, wholesale_min, wholesale_max, treads
     )
     return db.fetch_dicts(
         """
         WITH sold AS (
-            SELECT sku, count(*) AS sold
-            FROM wholesale
-            WHERE {date_where}
-            GROUP BY sku
+            {sold_sql}
         ),
         rows AS (
             SELECT
@@ -614,19 +949,19 @@ def _outside_only_summary(
             coalesce(sum(sold), 0) AS wholesale,
             count(*) FILTER (WHERE dim_sku IS NULL) AS unmatched_rows
         FROM rows
-        """.format(date_where=date_sql or "TRUE", outside_select=outside_select),
+        """.format(sold_sql=_sold_sql(date_sql, grade), outside_select=outside_select),
         list(date_params) + list(outside_params),
     )[0]
 
 
 def _outside_only_rows(
-    year_week, baskets, product_bs, sku, size, brand, name, start, end, wholesale_min, wholesale_max, limit
+    year_week, baskets, product_bs, sku, size, section, aspect, rim, brand, name, start, end, wholesale_min, wholesale_max, limit, grade=None, treads=None
 ):
     if product_bs:
         return []
     date_sql, date_params = _sale_date_sql(start, end, column="sale_date")
     outside_select, outside_params = _outside_skus_sql(
-        year_week, baskets, sku, size, brand, name, wholesale_min, wholesale_max
+        year_week, baskets, sku, size, section, aspect, rim, brand, name, wholesale_min, wholesale_max, treads
     )
     limit_sql = ""
     params = list(date_params) + list(outside_params)
@@ -636,15 +971,16 @@ def _outside_only_rows(
     return db.fetch_dicts(
         """
         WITH sold AS (
-            SELECT sku, count(*) AS sold
-            FROM wholesale
-            WHERE {date_where}
-            GROUP BY sku
+            {sold_sql}
         )
         SELECT
             '(no basket)' AS "Basket",
             outside_skus.sku AS "SKU",
+            outside_skus.sale_grade AS "Grade",
             outside_skus.size AS "Size",
+            outside_skus.section AS "Section",
+            outside_skus.aspect AS "Aspect",
+            outside_skus.rim AS "Rim",
             outside_skus.brand AS "Brand",
             outside_skus.name AS "Name",
             outside_skus.model AS "Model",
@@ -654,10 +990,10 @@ def _outside_only_rows(
             CAST(0 AS DOUBLE) AS "Stock",
             outside_skus.sold AS "Wholesale"
         FROM ({outside_select}) outside_skus
-        ORDER BY "Size", "SKU"
+        ORDER BY "Size", "SKU", "Grade"
         {limit_sql}
         """.format(
-            date_where=date_sql or "TRUE",
+            sold_sql=_sold_sql(date_sql, grade),
             outside_select=outside_select,
             limit_sql=limit_sql,
         ),
@@ -666,7 +1002,7 @@ def _outside_only_rows(
 
 
 def _outside_only_members_sql(
-    year_week, baskets, product_bs, sku, size, brand, name, start, end, wholesale_min, wholesale_max
+    year_week, baskets, product_bs, sku, size, section, aspect, rim, brand, name, start, end, wholesale_min, wholesale_max, grade=None, treads=None
 ):
     if product_bs:
         return (
@@ -675,7 +1011,11 @@ def _outside_only_members_sql(
                 SELECT
                     CAST(NULL AS VARCHAR) AS basket,
                     CAST(NULL AS VARCHAR) AS sku,
+                    CAST(NULL AS VARCHAR) AS grade,
                     CAST(NULL AS VARCHAR) AS size,
+                    CAST(NULL AS VARCHAR) AS section,
+                    CAST(NULL AS VARCHAR) AS aspect,
+                    CAST(NULL AS VARCHAR) AS rim,
                     CAST(NULL AS VARCHAR) AS brand,
                     CAST(NULL AS VARCHAR) AS name,
                     CAST(0 AS DOUBLE) AS stock,
@@ -687,27 +1027,31 @@ def _outside_only_members_sql(
         )
     date_sql, date_params = _sale_date_sql(start, end, column="sale_date")
     outside_select, outside_params = _outside_skus_sql(
-        year_week, baskets, sku, size, brand, name, wholesale_min, wholesale_max
+        year_week, baskets, sku, size, section, aspect, rim, brand, name, wholesale_min, wholesale_max, treads
     )
     sql = """
         WITH sold AS (
-            SELECT sku, count(*) AS sold
-            FROM wholesale
-            WHERE {date_where}
-            GROUP BY sku
+            {sold_sql}
         ),
         filtered AS (
             SELECT
                 '(no basket)' AS basket,
                 outside_skus.sku,
+                coalesce(outside_skus.sale_grade, '') AS grade,
                 coalesce(nullif(outside_skus.size, ''), '(no size)') AS size,
+                outside_skus.section,
+                outside_skus.aspect,
+                outside_skus.rim,
                 coalesce(nullif(outside_skus.brand, ''), '(no brand)') AS brand,
                 coalesce(nullif(outside_skus.name, ''), '(no name)') AS name,
                 CAST(0 AS DOUBLE) AS stock,
-                outside_skus.sold
+                outside_skus.sold AS sold
             FROM ({outside_select}) outside_skus
         )
-    """.format(date_where=date_sql or "TRUE", outside_select=outside_select)
+    """.format(
+        sold_sql=_sold_sql(date_sql, grade),
+        outside_select=outside_select,
+    )
     return sql, list(date_params) + list(outside_params)
 
 
@@ -718,11 +1062,15 @@ def _outside_union(
     baskets,
     sku,
     size,
+    section,
+    aspect,
+    rim,
     brand,
     name,
     wholesale_min,
     wholesale_max,
     wrapper,
+    treads=None,
 ):
     """Rows for wholesale SKUs that are absent from the selected tracking baskets.
 
@@ -731,15 +1079,18 @@ def _outside_union(
     if not include_outside or product_bs:
         return "", []
     outside_select, params = _outside_skus_sql(
-        year_week, baskets, sku, size, brand, name, wholesale_min, wholesale_max
+        year_week, baskets, sku, size, section, aspect, rim, brand, name, wholesale_min, wholesale_max, treads
     )
     return "UNION ALL " + wrapper.format(outside_select=outside_select), params
 
 
-def _outside_skus_sql(year_week, baskets, sku, size, brand, name, wholesale_min, wholesale_max):
+def _outside_skus_sql(year_week, baskets, sku, size, section, aspect, rim, brand, name, wholesale_min, wholesale_max, treads=None):
     membership, membership_params = _tracking_membership(year_week, baskets)
-    text_sql, text_params = _contains_sql(
-        (("w.sku", sku), ("d.size", size), ("d.brand", brand), ("d.name", name))
+    text_sql, text_params = _attribute_sql(
+        sku, size, section, aspect, rim, brand, name,
+        "w.sku", "d.size", "d.section", "d.aspect", "d.rim", "d.brand", "d.name",
+        treads=treads,
+        tread_col="d.tread",
     )
     bound_sql, bound_params = _count_bounds(wholesale_min, wholesale_max, "w.sold")
     clauses = [
@@ -754,7 +1105,11 @@ def _outside_skus_sql(year_week, baskets, sku, size, brand, name, wholesale_min,
     sql = """
         SELECT
             w.sku,
+            w.sale_grade,
             d.size,
+            d.section,
+            d.aspect,
+            d.rim,
             d.brand,
             d.name,
             d.model,
@@ -777,14 +1132,20 @@ def _tracking_membership(year_week, baskets):
     return "t.year_week = ? AND {baskets}".format(baskets=basket_sql), params
 
 
-def _tracking_filters(year_week, baskets, product_bs, sku, size, brand, name):
+def _tracking_filters(year_week, baskets, product_bs, sku, size, section, aspect, rim, brand, name, grade=None, treads=None):
     clauses = ["t.year_week = ?"]
     params = [year_week]
     clauses.append(_in_clause("t.basket", baskets, params))
     if product_bs:
         clauses.append(_in_clause("t.product_bs", product_bs, params))
-    text_sql, text_params = _contains_sql(
-        (("t.sku", sku), ("d.size", size), ("d.brand", brand), ("d.name", name))
+    grade_sql = _tracking_grade_clause(grade)
+    if grade_sql != "TRUE":
+        clauses.append(grade_sql)
+    text_sql, text_params = _attribute_sql(
+        sku, size, section, aspect, rim, brand, name,
+        "t.sku", "d.size", "d.section", "d.aspect", "d.rim", "d.brand", "d.name",
+        treads=treads,
+        tread_col="d.tread",
     )
     if text_sql:
         clauses.append(text_sql)
@@ -802,6 +1163,67 @@ def _contains_sql(pairs):
     return " AND ".join(clauses), params
 
 
+def _exact_sql(pairs):
+    """Match the whole trimmed value. An empty value adds no condition."""
+    clauses = []
+    params = []
+    for column, value in pairs:
+        if value and str(value).strip():
+            clauses.append("trim(coalesce({column}, '')) = ?".format(column=column))
+            params.append(str(value).strip())
+    return " AND ".join(clauses), params
+
+
+def _attribute_sql(
+    sku, size, section, aspect, rim, brand, name,
+    sku_col, size_col, section_col, aspect_col, rim_col, brand_col, name_col,
+    treads=None,
+    tread_col=None,
+):
+    contains_sql, contains_params = _contains_sql(((name_col, name),))
+    exact_sql, exact_params = _exact_sql(
+        (
+            (sku_col, sku),
+            (brand_col, brand),
+            (size_col, size),
+            (section_col, section),
+            (aspect_col, aspect),
+            (rim_col, rim),
+        )
+    )
+    clauses = []
+    params = []
+    if contains_sql:
+        clauses.append(contains_sql)
+        params.extend(contains_params)
+    if exact_sql:
+        clauses.append(exact_sql)
+        params.extend(exact_params)
+    tread_sql, tread_params = _tread_sql(treads, tread_col)
+    if tread_sql:
+        clauses.append(tread_sql)
+        params.extend(tread_params)
+    return " AND ".join(clauses), params
+
+
+def _tread_sql(treads, column):
+    """Exact tread match. An empty selection adds no condition."""
+    if not column or not treads:
+        return "", []
+    values = []
+    for value in treads:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            values.append(text)
+    if not values:
+        return "", []
+    params = []
+    clause = _in_clause("trim(coalesce({column}, ''))".format(column=column), values, params)
+    return clause, params
+
+
 def _count_bounds(minimum, maximum, column):
     clauses = []
     params = []
@@ -814,13 +1236,16 @@ def _count_bounds(minimum, maximum, column):
     return (" AND ".join(clauses) if clauses else "TRUE"), params
 
 
-def _wholesale_where(year_week, baskets, sku, size, brand, name, start, end):
+def _wholesale_where(year_week, baskets, sku, size, section, aspect, rim, brand, name, start, end, grade=None, treads=None):
     clauses = []
     params = []
     date_sql, date_params = _sale_date_sql(start, end)
     if date_sql:
         clauses.append(date_sql)
         params.extend(date_params)
+    sale_sql = _sale_grade_clause(grade, "w.majority")
+    if sale_sql != "TRUE":
+        clauses.append(sale_sql)
     if baskets:
         clauses.append(
             """w.sku IN (
@@ -831,8 +1256,11 @@ def _wholesale_where(year_week, baskets, sku, size, brand, name, start, end):
             )""".format(baskets=_in_clause("t.basket", baskets, params))
         )
         params.insert(len(date_params), year_week)
-    text_sql, text_params = _contains_sql(
-        (("w.sku", sku), ("d.size", size), ("d.brand", brand), ("d.name", name))
+    text_sql, text_params = _attribute_sql(
+        sku, size, section, aspect, rim, brand, name,
+        "w.sku", "d.size", "d.section", "d.aspect", "d.rim", "d.brand", "d.name",
+        treads=treads,
+        tread_col="d.tread",
     )
     if text_sql:
         clauses.append(text_sql)
@@ -852,13 +1280,18 @@ def _sale_date_sql(start, end, column="w.sale_date"):
     return " AND ".join(clauses), params
 
 
-def _sku_membership_filters(year_week, baskets, sku, size, brand, name):
+def _sku_membership_filters(year_week, baskets, sku, size, section, aspect, rim, brand, name, grade=None, treads=None):
+    """SKUs in the selected baskets. Grade filters the sale, not this membership."""
+    del grade
     clauses = ["t.year_week = ?"]
     params = [year_week]
     if baskets:
         clauses.append(_in_clause("t.basket", baskets, params))
-    text_sql, text_params = _contains_sql(
-        (("t.sku", sku), ("d.size", size), ("d.brand", brand), ("d.name", name))
+    text_sql, text_params = _attribute_sql(
+        sku, size, section, aspect, rim, brand, name,
+        "t.sku", "d.size", "d.section", "d.aspect", "d.rim", "d.brand", "d.name",
+        treads=treads,
+        tread_col="d.tread",
     )
     if text_sql:
         clauses.append(text_sql)
