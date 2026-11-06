@@ -57,6 +57,45 @@ def _baskets_changed():
         st.session_state["basket_baskets"] = chosen
 
 
+def _saleable_section(sku, grade, week, baskets):
+    """Quant snapshot for one SKU. Tracking stock is the selected baskets, when any."""
+    st.subheader("Saleable stock")
+    st.caption(
+        "Tires of the entered SKU whose Location contains Saleable in the loaded quant report. "
+        "Each ID is one tire. "
+        "Grade A is No Repair and Minor Repair. Grade B is Major Repair and Close to Sidewall. "
+        "Saleable tires is that file on one date. Tracking stock is the weekly average for the selected baskets, and the two can differ."
+    )
+    sku_text = "" if sku is None else str(sku).strip()
+    if queries.saleable_count() == 0:
+        st.caption("Reload the quant report on the Data page. Saleable tires are stored from that file.")
+        return
+    if not sku_text:
+        st.caption("Enter a SKU to see this table.")
+        return
+    saleable_rows = queries.saleable_summary(sku_text, grade, week, baskets)
+    saleable_ids = queries.saleable_tires(sku_text, grade)
+    if not saleable_ids:
+        st.caption("This SKU has no saleable tires in the loaded quant report.")
+    st.dataframe(
+        saleable_rows,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "Saleable tires": st.column_config.NumberColumn("Saleable tires", format="%d"),
+            "Tracking stock": st.column_config.NumberColumn("Tracking stock", format="%.3f"),
+        },
+    )
+    st.dataframe(saleable_ids, hide_index=True, width="stretch")
+    st.download_button(
+        "Download saleable IDs",
+        data=_to_csv(saleable_ids),
+        file_name="saleable-{sku}.csv".format(sku=sku_text),
+        mime="text/csv",
+        disabled=not saleable_ids,
+    )
+
+
 def _optional_number(key):
     if key not in st.session_state:
         st.session_state[key] = None
@@ -80,7 +119,8 @@ st.caption(
     "Stock is the tracking grade. "
     "Wholesale is that grade's Majority, including a grade that has no stock row. "
     "Wholesale min and max keep rows whose own count is inside the range. "
-    "A SKU in two selected baskets shows the same wholesale count on both rows of that grade."
+    "A SKU in two selected baskets shows the same wholesale count on both rows of that grade. "
+    "Saleable stock, at the bottom, is a separate count from the quant report."
 )
 
 restore_widgets(FILTER_KEYS)
@@ -201,6 +241,7 @@ else:
     query_baskets = [item for item in chosen_baskets if item not in _BASKET_TOTALS]
 if not query_baskets and not outside_only:
     st.info("Select one or more baskets.")
+    _saleable_section(sku, grade, week, None)
     st.stop()
 if (include_outside or outside_only) and chosen_product_bs:
     st.caption("Product BS is set, so SKUs that are not in the tracking report are left out.")
@@ -365,4 +406,11 @@ st.download_button(
     file_name="basket-skus-{week}.csv".format(week=week),
     mime="text/csv",
     disabled=not full_rows,
+)
+
+_saleable_section(
+    sku,
+    grade,
+    week,
+    None if outside_only else query_baskets,
 )

@@ -16,6 +16,7 @@ TRACKING_COLUMNS = (
 )
 
 QUANT_COLUMNS = (
+    ("id", "ID"),
     ("sku", "SKU"),
     ("internal category", "Internal Category"),
     ("product name", "Product Name"),
@@ -35,6 +36,8 @@ QUANT_COLUMNS = (
 
 # A tire on this location is a wholesale sale. The sales order date and number are not required.
 WHOLESALE_LOCATION = "Physical Locations / FRD / Utilisation Scrap"
+# A tire whose Location contains this text is in saleable stock. The match is the substring.
+SALEABLE_MARK = "Saleable"
 
 
 def load_tracking(path, on_progress=None):
@@ -75,7 +78,9 @@ def load_quant(path):
     """Replace sku_dim and wholesale sales from one quant CSV.
 
     The file is scanned once. Wholesale rows are tires whose Location is
-    WHOLESALE_LOCATION. The stored date is Incoming date to saleable location.
+    WHOLESALE_LOCATION. Saleable rows are tires whose Location contains
+    SALEABLE_MARK, one row per tire, including its ID. The stored date is
+    Incoming date to saleable location.
     """
     path = _existing_file(path, "Quant")
     if path.stat().st_size == 0:
@@ -90,11 +95,13 @@ def load_quant(path):
     _quant_raw(path, mapping)
     _sku_stage_from_quant()
     _wholesale_stage_from_quant(path)
+    _saleable_stage_from_quant()
 
     sku_rows = db.fetch_one("SELECT count(*) FROM sku_stage")[0]
     if not sku_rows:
         raise ValueError("The quant file returned no SKUs. The previous tables were left unchanged.")
     wholesale_rows = db.fetch_one("SELECT count(*) FROM wholesale_stage")[0]
+    saleable_rows = db.fetch_one("SELECT count(*) FROM saleable_stage")[0]
     unparsed_dates = db.fetch_one(
         "SELECT count(*) FROM wholesale_stage WHERE sale_date IS NULL"
     )[0]
@@ -134,9 +141,18 @@ def load_quant(path):
             FROM wholesale_stage
             """
         )
+        db.execute("DELETE FROM saleable")
+        db.execute(
+            """
+            INSERT INTO saleable (tire_id, sku, majority, location)
+            SELECT tire_id, sku, majority, location
+            FROM saleable_stage
+            """
+        )
     return {
         "rows": sku_rows,
         "wholesale_rows": wholesale_rows,
+        "saleable_rows": saleable_rows,
         "unparsed_dates": unparsed_dates,
         "last_sale_date": last_sale_date,
         "source": "quant",
@@ -257,6 +273,7 @@ def load_mysql():
 
 def _quant_raw(path, mapping):
     fields = (
+        ("id", "id"),
         ("sku", "sku"),
         ("product name", "name"),
         ("brand", "brand"),
@@ -314,6 +331,25 @@ def _sku_stage_from_quant():
         WHERE sku IS NOT NULL
         GROUP BY sku
         """
+    )
+
+
+def _saleable_stage_from_quant():
+    db.execute("DROP TABLE IF EXISTS saleable_stage")
+    db.execute(
+        """
+        CREATE TEMP TABLE saleable_stage AS
+        SELECT
+            id AS tire_id,
+            sku,
+            majority,
+            location
+        FROM quant_raw
+        WHERE sku IS NOT NULL
+          AND id IS NOT NULL
+          AND position(? IN location) > 0
+        """,
+        [SALEABLE_MARK],
     )
 
 

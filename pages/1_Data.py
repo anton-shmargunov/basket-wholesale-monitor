@@ -87,8 +87,11 @@ st.caption(
     "CSV, about 2 GB. Paste a path. The uploader is not used because the file is larger than Streamlit's upload limit. "
     "This replaces the SKU attribute table and the wholesale sales. "
     "A wholesale sale is a tire at {location}. "
-    "Each SKU keeps Tread. Each sale keeps its Majority, which is how Grade A and Grade B split wholesale.".format(
-        location=ingest.WHOLESALE_LOCATION
+    "Each SKU keeps Tread. Each sale keeps its Majority, which is how Grade A and Grade B split wholesale. "
+    "Each tire whose Location contains {mark} is stored with its ID, SKU, Majority, and Location. "
+    "Reload this file to fill that list. MySQL does not replace it.".format(
+        location=ingest.WHOLESALE_LOCATION,
+        mark=ingest.SALEABLE_MARK,
     )
 )
 quant_path = st.text_input("Quant CSV path", key="data_quant_path")
@@ -100,9 +103,10 @@ if st.button("Load quant"):
         last_date = result["last_sale_date"]
         last_text = last_date.isoformat()[:10] if last_date is not None else "none"
         st.success(
-            "Loaded {rows:,} SKUs and {wholesale:,} wholesale sales. Last incoming date to saleable location: {last}.".format(
+            "Loaded {rows:,} SKUs, {wholesale:,} wholesale sales, and {saleable:,} saleable tires. Last incoming date to saleable location: {last}.".format(
                 rows=result["rows"],
                 wholesale=result["wholesale_rows"],
+                saleable=result["saleable_rows"],
                 last=last_text,
             )
         )

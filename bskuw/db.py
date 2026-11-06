@@ -51,6 +51,13 @@ CREATE TABLE IF NOT EXISTS quant_report (
     source_file VARCHAR,
     last_sale_date DATE
 );
+
+CREATE TABLE IF NOT EXISTS saleable (
+    tire_id VARCHAR,
+    sku VARCHAR,
+    majority VARCHAR,
+    location VARCHAR
+);
 """
 
 _WHOLESALE_TABLE = """
@@ -68,6 +75,7 @@ CREATE INDEX IF NOT EXISTS idx_tracking_week_basket ON tracking (year_week, bask
 CREATE INDEX IF NOT EXISTS idx_sku_dim_sku ON sku_dim (sku);
 CREATE INDEX IF NOT EXISTS idx_wholesale_sku ON wholesale (sku);
 CREATE INDEX IF NOT EXISTS idx_wholesale_sale_date ON wholesale (sale_date);
+CREATE INDEX IF NOT EXISTS idx_saleable_sku ON saleable (sku);
 """
 
 # Ambiguous slash dates are day/month/year. A month/day value is tried only
@@ -112,6 +120,7 @@ def get_connection():
                 _CONNECTION = _open_database(DB_PATH)
         _ensure_sku_columns(_CONNECTION)
         _ensure_grade_columns(_CONNECTION)
+        _ensure_saleable_table(_CONNECTION)
         return _CONNECTION
 
 
@@ -304,6 +313,21 @@ def _ensure_sku_columns(connection):
             connection.execute("ALTER TABLE sku_dim ADD COLUMN {name} VARCHAR".format(name=name))
 
 
+def _ensure_saleable_table(connection):
+    """Keep one row per tire that sits on a saleable location."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS saleable (
+            tire_id VARCHAR,
+            sku VARCHAR,
+            majority VARCHAR,
+            location VARCHAR
+        )
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_saleable_sku ON saleable (sku)")
+
+
 def _ensure_grade_columns(connection):
     """Add tracking grade and per-sale Majority on databases created before them."""
     tracking_columns = [row[0] for row in connection.execute("DESCRIBE tracking").fetchall()]
@@ -322,6 +346,7 @@ def _ensure_schema(connection):
         connection.execute("DROP TABLE wholesale")
         connection.execute(_WHOLESALE_TABLE)
     _ensure_grade_columns(connection)
+    _ensure_saleable_table(connection)
     connection.execute(_INDEXES)
     connection.execute(_PARSE_MACRO)
 

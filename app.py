@@ -7,7 +7,7 @@ from bskuw.db import get_connection
 def home():
     get_connection()
     st.title("Basket-Wholesale Monitor (BWM)")
-    st.caption("v.1.0.1")
+    st.caption("v.1.0.2")
     st.caption("Tracking baskets, SKU attributes, and wholesale sales on this machine.")
     st.caption("On Data, download the database to keep a copy on your computer. Upload that file to open it again.")
 

@@ -21,6 +21,8 @@ Tracking basket report, columns `year_week`, `basket`, `product BS`, `SKU`, `Sto
 
 Quant CSV supplies both the SKU attribute table and wholesale sales. Give a file path. The file is about 2 GB, so it is not sent through the browser upload. SKU attributes kept are `SKU`, `Internal Category`, `Product Name`, `Condition`, `Brand`, `Model`, `Size`, `Section`, `Aspect`, `Rim`, `Tread`, `Majority`, one row per SKU. If several quant rows share a SKU, the most common value of each attribute is kept.
 
+A tire whose `Location` contains `Saleable` is kept as its own row: `ID`, `SKU`, `Majority`, and `Location`. That is the quant snapshot on the file's date, so the count can differ from `StockQty_W`. Grade A is `No Repair` and `Minor Repair`. Grade B is `Major Repair` and `Close to Sidewall`. The Basket SKUs page shows the count and the ID list for the SKU you enter. Reload the quant file to fill this table. MySQL does not replace it.
+
 A wholesale sale is one tire whose `Location` is `Physical Locations / FRD / Utilisation Scrap`. Each sale keeps its `Majority`. Grade A counts `No Repair` and `Minor Repair`. Grade B counts `Major Repair` and `Close to Sidewall`. A blank sales order date or number does not exclude it. Reload the quant file after this change so Majority is stored on each sale. Loading a quant file replaces the wholesale table and stores the latest `Incoming date to saleable location` in the whole file, including rows that are not wholesale. A time may include fractional seconds, such as `2021-11-02 21:19:18.443852`. The Basket SKUs page and the Wholesale page both count wholesale tires and filter that date. An empty start date means no lower bound, and an empty end date means no upper bound. The preset list is empty, last week, last month, and last year. Those three end on that latest incoming date and cover 7, 30, and 365 days. SKU, Brand, Size, Section, Aspect, and Rim match the whole value. Name matches any part of the name. A sale counts for a basket when its SKU is in that basket in the selected tracking week. Filters stay filled when you switch pages.
 
 MySQL table `clear_data.clear_sku`: `sku`, `name`, `brand`, `model`, `size`, `tread`, `condition`. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill in host, port, user, password, and database. `secrets.toml` is gitignored. Internal category and majority stay empty for a MySQL load. Either quant or MySQL replaces the SKU table. Wholesale sales are not read from MySQL.
@@ -29,7 +31,7 @@ MySQL table `clear_data.clear_sku`: `sku`, `name`, `brand`, `model`, `size`, `tr
 
 - Home — row counts and which weeks are loaded.
 - Data — load tracking, quant, or MySQL.
-- Basket SKUs — SKUs for one or more baskets, grouped by SKU, size, brand, name, or basket, with stock and a wholesale count. Filters include SKU, size, brand, name, and a wholesale min and max.
+- Basket SKUs — SKUs for one or more baskets, grouped by SKU, size, brand, name, or basket, with stock and a wholesale count. Filters include SKU, size, brand, name, and a wholesale min and max. Enter a SKU to see saleable tires from the quant report, with their IDs, beside the tracking stock.
 - Wholesale — count wholesale sales by SKU, size, brand, name, or basket, for a sales-order date range.
 
 ## Streamlit Community Cloud

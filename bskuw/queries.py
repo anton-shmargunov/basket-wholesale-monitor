@@ -5,7 +5,9 @@ stock across baskets. A wholesale sale does not carry a basket: it counts for
 a basket when its SKU is in that basket in the selected week. Each stored
 wholesale row is one sold tire. Majority decides that tire's grade. The sale
 counts for that grade even when the tracking snapshot has stock only for
-another grade of the same SKU.
+another grade of the same SKU. A saleable row is one tire whose quant
+Location contains Saleable. That count is a snapshot of the quant file and
+can differ from the tracking stock.
 """
 
 from bskuw import db
@@ -251,6 +253,97 @@ def _graded_ctes(member_where, date_where, grade):
         member_where=member_where,
         stored_grade=_stored_grade_clause(grade, "p.grade"),
         extra_grade=_stored_grade_clause(grade, "e.grade"),
+    )
+
+
+def saleable_count():
+    """How many saleable tires the loaded quant report stored."""
+    row = db.fetch_one("SELECT count(*) FROM saleable")
+    if row is None:
+        return 0
+    return row[0]
+
+
+def saleable_summary(sku, grade=None, year_week=None, baskets=None):
+    """Saleable tires of one SKU by grade, beside that week's tracking stock.
+
+    Saleable tires are quant rows whose Location contains Saleable.
+    Tracking stock is the weekly average for the selected baskets.
+    """
+    text = "" if sku is None else str(sku).strip()
+    if not text:
+        return []
+    basket_sql = "FALSE"
+    params = [text, text]
+    if year_week and baskets:
+        basket_params = []
+        basket_sql = "t.year_week = ? AND {baskets}".format(
+            baskets=_in_clause("t.basket", list(baskets), basket_params)
+        )
+        params.extend([year_week])
+        params.extend(basket_params)
+    return db.fetch_dicts(
+        """
+        WITH quant AS (
+            SELECT coalesce({grade_expr}, '') AS grade, count(*) AS tires
+            FROM saleable s
+            WHERE trim(s.sku) = ?
+              AND {grade_filter}
+            GROUP BY 1
+        ),
+        track AS (
+            SELECT trim(coalesce(t.grade, '')) AS grade,
+                   coalesce(sum(t.stock_qty_w), 0) AS stock
+            FROM tracking t
+            WHERE trim(t.sku) = ?
+              AND {track_grade}
+              AND {basket_sql}
+            GROUP BY 1
+        )
+        SELECT
+            coalesce(q.grade, k.grade) AS "Grade",
+            coalesce(q.tires, 0) AS "Saleable tires",
+            coalesce(k.stock, 0) AS "Tracking stock"
+        FROM quant q
+        FULL OUTER JOIN track k ON q.grade = k.grade
+        ORDER BY
+            CASE coalesce(q.grade, k.grade) WHEN 'A' THEN 0 WHEN 'B' THEN 1 ELSE 2 END,
+            coalesce(q.grade, k.grade)
+        """.format(
+            grade_expr=_sale_grade_expr("s.majority"),
+            grade_filter=_sale_grade_clause(grade, "s.majority"),
+            track_grade=_tracking_grade_clause(grade, "t.grade"),
+            basket_sql=basket_sql,
+        ),
+        params,
+    )
+
+
+def saleable_tires(sku, grade=None):
+    """One row per saleable tire of this SKU: ID, grade, Majority, location."""
+    text = "" if sku is None else str(sku).strip()
+    if not text:
+        return []
+    grade_expr = _sale_grade_expr("s.majority")
+    return db.fetch_dicts(
+        """
+        SELECT
+            s.tire_id AS "ID",
+            coalesce({grade_expr}, '') AS "Grade",
+            coalesce(s.majority, '') AS "Majority",
+            coalesce(s.location, '') AS "Location"
+        FROM saleable s
+        WHERE trim(s.sku) = ?
+          AND {grade_filter}
+        ORDER BY
+            CASE coalesce({grade_expr}, '') WHEN 'A' THEN 0 WHEN 'B' THEN 1 ELSE 2 END,
+            TRY_CAST(s.tire_id AS BIGINT),
+            s.tire_id
+        """.format(
+            grade_expr=grade_expr,
+            grade_filter=_sale_grade_clause(grade, "s.majority"),
+        ),
+        [text],
     )
 
 
