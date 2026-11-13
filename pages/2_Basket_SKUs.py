@@ -1,5 +1,6 @@
 import csv
 import io
+import numbers
 
 import streamlit as st
 
@@ -42,6 +43,251 @@ def _to_csv(rows):
     return buffer.getvalue()
 
 
+def _as_records(edited):
+    if hasattr(edited, "to_dict"):
+        return edited.to_dict("records")
+    return [dict(row) for row in edited]
+
+
+def _is_checked(value):
+    try:
+        if value != value:
+            return False
+    except Exception:
+        return False
+    return bool(value)
+
+
+def _checked_rows(original, edited):
+    """Rows whose Select box is checked, using the original row values."""
+    records = _as_records(edited)
+    if len(records) != len(original):
+        return list(original)
+    kept = []
+    for source, record in zip(original, records):
+        if _is_checked(record.get("Select")):
+            kept.append(source)
+    return kept
+
+
+def _stable_value(value):
+    """Keep editor data identical across reruns so a click is not dropped."""
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        return round(float(value), 3)
+    return value
+
+
+def _toggle_header(flags_key, gen_key, all_key, hold_key, count):
+    """Header checkbox replaces every row, then the table is shown again."""
+    checked = bool(st.session_state.get(all_key))
+    st.session_state[flags_key] = [checked] * count
+    st.session_state[gen_key] = int(st.session_state.get(gen_key, 0)) + 1
+    st.session_state[hold_key] = st.session_state[gen_key]
+
+
+def _select_editor(rows, key, column_config, header_key):
+    """Checkbox as the first column. The header checkbox sets every row."""
+    if not rows:
+        return []
+    all_key = header_key + "_checked"
+    gen_key = header_key + "_gen"
+    flags_key = header_key + "_flags"
+    hold_key = header_key + "_hold"
+    seen_key = header_key + "_seen"
+
+    if st.session_state.get(seen_key) != key or len(st.session_state.get(flags_key) or []) != len(rows):
+        st.session_state[seen_key] = key
+        st.session_state[flags_key] = [True] * len(rows)
+        st.session_state[all_key] = True
+        st.session_state[gen_key] = int(st.session_state.get(gen_key, 0)) + 1
+        st.session_state[hold_key] = st.session_state[gen_key]
+
+    flags = [bool(flag) for flag in st.session_state.get(flags_key)]
+    all_on = all(flags)
+    if st.session_state.get(all_key) != all_on:
+        st.session_state[all_key] = all_on
+
+    with st.container(key=header_key):
+        st.checkbox(
+            "Select all",
+            key=all_key,
+            on_change=_toggle_header,
+            args=(flags_key, gen_key, all_key, hold_key, len(rows)),
+            label_visibility="collapsed",
+            help="Check or uncheck every row.",
+        )
+
+    flags = [bool(flag) for flag in st.session_state.get(flags_key)]
+    table = []
+    for row, flag in zip(rows, flags):
+        item = {"Select": flag}
+        for name, value in row.items():
+            item[name] = _stable_value(value)
+        table.append(item)
+    columns = list(table[0].keys())
+    config = {
+        "Select": st.column_config.CheckboxColumn(
+            "",
+            default=True,
+            width=64,
+            pinned=True,
+        )
+    }
+    config.update(column_config)
+    edited = st.data_editor(
+        table,
+        key="{key}:{gen}".format(key=key, gen=st.session_state.get(gen_key, 0)),
+        hide_index=True,
+        width="stretch",
+        height=420,
+        num_rows="fixed",
+        disabled=[name for name in columns if name != "Select"],
+        column_order=columns,
+        column_config=config,
+    )
+    records = _as_records(edited)
+    if len(records) == len(rows):
+        new_flags = [_is_checked(record.get("Select")) for record in records]
+        gen = int(st.session_state.get(gen_key, 0))
+        if new_flags != flags:
+            if st.session_state.get(hold_key) == gen:
+                # The click that saved these flags was applied again and would clear them.
+                st.session_state.pop(hold_key, None)
+                st.session_state[gen_key] = gen + 1
+            else:
+                st.session_state[flags_key] = new_flags
+                st.session_state[gen_key] = gen + 1
+                st.session_state[hold_key] = gen + 1
+            st.rerun()
+        else:
+            st.session_state.pop(hold_key, None)
+    return _checked_rows(rows, edited)
+
+
+def _editor_key(prefix, identity):
+    return "{prefix}-{digest}".format(prefix=prefix, digest=hash(tuple(identity)))
+
+
+def _sku_pair(row):
+    sku = "" if row.get("SKU") is None else str(row.get("SKU")).strip()
+    grade = row.get("Grade")
+    grade_text = "" if grade is None else str(grade).strip()
+    return sku, grade_text
+
+
+def _saved_flags(header_key, key, count):
+    """Flags saved for this table. A new row set starts with every row checked."""
+    flags = st.session_state.get(header_key + "_flags")
+    if st.session_state.get(header_key + "_seen") != key or len(flags or []) != count:
+        return [True] * count
+    return [bool(flag) for flag in flags]
+
+
+def _grouped_editor_key(group_by, rows):
+    return _editor_key("basket_grouped", [group_by] + [row.get(group_by) for row in rows])
+
+
+def _sku_editor_key(rows):
+    return _editor_key(
+        "basket_skus",
+        [(_sku_pair(row)[0], _sku_pair(row)[1], row.get("Basket")) for row in rows],
+    )
+
+
+def _text(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _whole_number(value):
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return 0
+    if value != value:
+        return 0
+    return int(value)
+
+
+def _working_rows(grouped_rows, sku_rows, group_by):
+    """Filtered rows that the checkboxes still include.
+
+    Checked groups decide which SKUs remain. While every visible SKU row is
+    checked, rows past the display limit stay in the totals. Once a SKU row
+    is unchecked, only the checked SKU rows are counted.
+    """
+    group_flags = _saved_flags(
+        "bskuw_grouped_header",
+        _grouped_editor_key(group_by, grouped_rows),
+        len(grouped_rows),
+    )
+    selected_groups = set(
+        row.get(group_by) for row, flag in zip(grouped_rows, group_flags) if flag
+    )
+    filtered = [row for row in sku_rows if queries.group_value(row, group_by) in selected_groups]
+    visible = filtered[:DISPLAY_LIMIT]
+    sku_flags = _saved_flags("bskuw_skus_header", _sku_editor_key(visible), len(visible))
+    if sku_flags and not all(sku_flags):
+        working = [row for row, flag in zip(visible, sku_flags) if flag]
+    else:
+        working = filtered
+    return filtered, working
+
+
+def _sum_up(rows):
+    """Totals for the rows the checkboxes kept. Each saleable tire counts once."""
+    skus = set()
+    sizes = set()
+    brands = set()
+    names = set()
+    pairs = {}
+    unmatched = 0
+    for row in rows:
+        sku, grade = _sku_pair(row)
+        if sku:
+            skus.add(sku)
+        size = _text(row.get("Size"))
+        brand = _text(row.get("Brand"))
+        name = _text(row.get("Name"))
+        if size:
+            sizes.add(size)
+        if brand:
+            brands.add(brand)
+        if name:
+            names.add(name)
+        if sku and (sku, grade) not in pairs:
+            pairs[(sku, grade)] = (
+                _whole_number(row.get("Stock on Saleable")),
+                _whole_number(row.get("Wholesale")),
+            )
+        if not size and not brand and not name:
+            unmatched += 1
+    return {
+        "sku_count": len(skus),
+        "saleable": sum(item[0] for item in pairs.values()),
+        "wholesale": sum(item[1] for item in pairs.values()),
+        "size_count": len(sizes),
+        "brand_count": len(brands),
+        "name_count": len(names),
+        "unmatched_rows": unmatched,
+    }
+
+
+def _pairs_from_rows(rows):
+    pairs = []
+    seen = set()
+    for row in rows:
+        pair = _sku_pair(row)
+        if not pair[0] or pair in seen:
+            continue
+        seen.add(pair)
+        pairs.append(pair)
+    return pairs
+
+
 def _baskets_changed():
     """Total, Total baskets, and Not in Basket stand alone."""
     chosen = list(st.session_state.get("basket_baskets") or [])
@@ -57,42 +303,55 @@ def _baskets_changed():
         st.session_state["basket_baskets"] = chosen
 
 
-def _saleable_section(sku, grade, week, baskets):
-    """Quant snapshot for one SKU. Tracking stock is the selected baskets, when any."""
+def _saleable_section(pairs, week, baskets):
+    """Quant snapshot for the checked SKUs. Tracking stock is the selected baskets."""
     st.subheader("Saleable stock")
     st.caption(
-        "Tires of the entered SKU whose Location contains Saleable in the loaded quant report. "
+        "Tires whose Location contains Saleable, for the SKUs checked above. "
         "Each ID is one tire. "
         "Grade A is No Repair and Minor Repair. Grade B is Major Repair and Close to Sidewall. "
-        "Saleable tires is that file on one date. Tracking stock is the weekly average for the selected baskets, and the two can differ."
+        "Stock on Saleable is the quant file on one date. Tracking stock is the weekly average for the selected baskets, and the two can differ."
     )
-    sku_text = "" if sku is None else str(sku).strip()
     if queries.saleable_count() == 0:
         st.caption("Reload the quant report on the Data page. Saleable tires are stored from that file.")
         return
-    if not sku_text:
-        st.caption("Enter a SKU to see this table.")
+    if not pairs:
+        st.caption("Select at least one SKU to see saleable tires.")
         return
-    saleable_rows = queries.saleable_summary(sku_text, grade, week, baskets)
-    saleable_ids = queries.saleable_tires(sku_text, grade)
-    if not saleable_ids:
-        st.caption("This SKU has no saleable tires in the loaded quant report.")
+    summary = queries.saleable_summary(pairs, week, baskets)
+    total = queries.saleable_tire_count(pairs)
+    tires = queries.saleable_tires(pairs, limit=DISPLAY_LIMIT)
+    if total == 0:
+        st.caption("The selected SKUs have no saleable tires in the loaded quant report.")
+    elif total > DISPLAY_LIMIT:
+        st.caption(
+            "Showing the first {limit:,} of {total:,} saleable tires.".format(
+                limit=DISPLAY_LIMIT, total=total
+            )
+        )
+    shown_summary = summary[:DISPLAY_LIMIT]
+    if len(summary) > DISPLAY_LIMIT:
+        st.caption(
+            "Showing the first {limit:,} of {total:,} saleable stock rows.".format(
+                limit=DISPLAY_LIMIT, total=len(summary)
+            )
+        )
     st.dataframe(
-        saleable_rows,
+        shown_summary,
         hide_index=True,
         width="stretch",
         column_config={
-            "Saleable tires": st.column_config.NumberColumn("Saleable tires", format="%d"),
+            "Stock on Saleable": st.column_config.NumberColumn("Stock on Saleable", format="%d"),
             "Tracking stock": st.column_config.NumberColumn("Tracking stock", format="%.3f"),
         },
     )
-    st.dataframe(saleable_ids, hide_index=True, width="stretch")
+    st.dataframe(tires, hide_index=True, width="stretch")
     st.download_button(
         "Download saleable IDs",
-        data=_to_csv(saleable_ids),
-        file_name="saleable-{sku}.csv".format(sku=sku_text),
+        data=_to_csv(tires),
+        file_name="saleable-ids.csv",
         mime="text/csv",
-        disabled=not saleable_ids,
+        disabled=not tires,
     )
 
 
@@ -110,17 +369,55 @@ def _optional_number(key):
 
 
 get_connection()
+st.markdown(
+    """
+    <style>
+    div.st-key-bskuw_grouped_header,
+    div.st-key-bskuw_skus_header {
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: visible !important;
+        position: relative;
+        z-index: 6;
+    }
+    div.st-key-bskuw_grouped_header [data-testid="stCheckbox"],
+    div.st-key-bskuw_skus_header [data-testid="stCheckbox"] {
+        position: absolute;
+        top: 24px;
+        left: 25px;
+        width: 28px;
+        min-height: 0;
+        margin: 0;
+        z-index: 6;
+    }
+    div.st-key-bskuw_grouped_header [data-testid="stCheckbox"] label,
+    div.st-key-bskuw_skus_header [data-testid="stCheckbox"] label {
+        min-height: 0;
+    }
+    div.st-key-bskuw_grouped_header [data-testid="stWidgetLabel"],
+    div.st-key-bskuw_skus_header [data-testid="stWidgetLabel"] {
+        display: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.title("Basket SKUs")
 st.caption(
     "SKUs in the selected baskets for one week. "
-    "Stock is that week's snapshot. "
+    "Tracking Stock is the tracking basket average for that week. "
+    "Stock on Saleable counts tires whose quant location contains Saleable. "
     "Wholesale is how many times that SKU was sold as wholesale in the incoming-date range. "
     "Grade A and grade B are separate rows. "
-    "Stock is the tracking grade. "
-    "Wholesale is that grade's Majority, including a grade that has no stock row. "
+    "Tracking Stock follows the tracking grade. "
+    "Stock on Saleable and wholesale follow that grade's Majority, including a grade that has no stock row. "
     "Wholesale min and max keep rows whose own count is inside the range. "
-    "A SKU in two selected baskets shows the same wholesale count on both rows of that grade. "
-    "Saleable stock, at the bottom, is a separate count from the quant report."
+    "A SKU in two selected baskets shows the same saleable count and the same wholesale count on both rows of that grade. "
+    "The Grouped and SKU tables start with every row checked. "
+    "Uncheck a group to drop its SKUs from the SKU table and the totals. "
+    "Uncheck a SKU row to drop that SKU and grade from the totals and from saleable stock."
 )
 
 restore_widgets(FILTER_KEYS)
@@ -221,8 +518,8 @@ if grade in ("A", "B"):
     if not loaded_grade["tracking"] or not loaded_grade["wholesale"]:
         st.info(
             "Reload the tracking report and the quant report on the Data page. "
-            "Stock of a grade comes from the tracking file. "
-            "Wholesale of a grade comes from Majority on each tire, even when that grade has no stock."
+            "Tracking Stock of a grade comes from the tracking file. "
+            "Stock on Saleable and wholesale of a grade come from Majority on each tire, even when that grade has no stock."
         )
 
 unparsed = queries.wholesale_unparsed_dates()
@@ -241,20 +538,19 @@ else:
     query_baskets = [item for item in chosen_baskets if item not in _BASKET_TOTALS]
 if not query_baskets and not outside_only:
     st.info("Select one or more baskets.")
-    _saleable_section(sku, grade, week, None)
     st.stop()
 if (include_outside or outside_only) and chosen_product_bs:
     st.caption("Product BS is set, so SKUs that are not in the tracking report are left out.")
 elif outside_only:
     st.caption(
-        "Not in Basket lists SKUs with a wholesale sale that are not in this week's tracking report. Those SKUs have no stock."
+        "Not in Basket lists SKUs with a wholesale sale that are not in this week's tracking report. Those SKUs have no Tracking Stock."
     )
 elif include_outside:
     st.caption(
-        "Total includes wholesale sales of SKUs that are not in this week's tracking report. Those SKUs have no stock."
+        "Total includes wholesale sales of SKUs that are not in this week's tracking report. Those SKUs have no Tracking Stock."
     )
 
-summary = queries.basket_summary(
+grouped_rows = queries.basket_grouped(
     week,
     query_baskets,
     chosen_product_bs,
@@ -265,6 +561,7 @@ summary = queries.basket_summary(
     rim,
     brand,
     name,
+    group_by,
     start,
     end,
     wholesale_min,
@@ -274,14 +571,43 @@ summary = queries.basket_summary(
     grade,
     treads=chosen_treads,
 )
+sku_rows = queries.basket_rows(
+    week,
+    query_baskets,
+    chosen_product_bs,
+    sku,
+    size,
+    section,
+    aspect,
+    rim,
+    brand,
+    name,
+    start=start,
+    end=end,
+    wholesale_min=wholesale_min,
+    wholesale_max=wholesale_max,
+    include_outside=include_outside,
+    outside_only=outside_only,
+    grade=grade,
+    treads=chosen_treads,
+)
+filtered_rows, working_rows = _working_rows(grouped_rows, sku_rows, group_by)
+summary = _sum_up(working_rows)
 sku_col, stock_col, wholesale_col = st.columns(3)
 sku_col.metric("SKUs", "{:,}".format(summary["sku_count"]))
-stock_col.metric("Stock", "{:,.3f}".format(summary["stock_qty_w"]))
+stock_col.metric("Stock on Saleable", "{:,}".format(summary["saleable"]))
 wholesale_col.metric("Wholesale", "{:,}".format(summary["wholesale"]))
 size_col, brand_col, name_col = st.columns(3)
 size_col.metric("Sizes", "{:,}".format(summary["size_count"]))
 brand_col.metric("Brands", "{:,}".format(summary["brand_count"]))
 name_col.metric("Names", "{:,}".format(summary["name_count"]))
+st.caption(
+    "Totals follow the checked rows. "
+    "Uncheck a group to drop its SKUs. "
+    "While every SKU row stays checked, totals include filtered rows past the display limit. "
+    "Uncheck a SKU row and the totals use only the checked SKU rows. "
+    "Stock on Saleable counts each saleable tire once."
+)
 
 if summary["unmatched_rows"]:
     unmatched = summary["unmatched_rows"]
@@ -297,11 +623,11 @@ st.subheader("Grouped")
 if outside_only and group_by == "Basket":
     st.caption("These SKUs are not in this week's tracking report, so they sit in (no basket).")
 elif outside_only:
-    st.caption("Wholesale counts each tire once. These SKUs are not in this week's tracking report and have no stock.")
+    st.caption("Wholesale and Stock on Saleable count each tire once. These SKUs are not in this week's tracking report and have no Tracking Stock.")
 elif group_by == "Basket":
     st.caption(
-        "Stock is summed inside each basket. "
-        "A wholesale sale is counted in every selected basket that contains its SKU."
+        "Tracking Stock is summed inside each basket. "
+        "Stock on Saleable and a wholesale sale are counted in every selected basket that contains that SKU and grade."
         + (
             " (no basket) holds sales whose SKU is not in this week's tracking report."
             if include_outside
@@ -310,107 +636,61 @@ elif group_by == "Basket":
     )
 else:
     st.caption(
-        "Stock is summed across the selected baskets. Wholesale counts each tire once."
+        "Tracking Stock is summed across the selected baskets. Stock on Saleable and wholesale count each tire once."
         + (
             " Sales of SKUs that are not in this week's tracking report are included."
             if include_outside
             else ""
         )
     )
-st.dataframe(
-    queries.basket_grouped(
-        week,
-        query_baskets,
-        chosen_product_bs,
-        sku,
-        size,
-        section,
-        aspect,
-        rim,
-        brand,
-        name,
-        group_by,
-        start,
-        end,
-        wholesale_min,
-        wholesale_max,
-        include_outside,
-        outside_only,
-        grade,
-        treads=chosen_treads,
-    ),
-    hide_index=True,
-    width="stretch",
-    column_config={
-        "Stock": st.column_config.NumberColumn("Stock", format="%.3f"),
-        "Wholesale": st.column_config.NumberColumn("Wholesale", format="%d"),
-    },
+number_columns = {
+    "Tracking Stock": st.column_config.NumberColumn("Tracking Stock", format="%.3f"),
+    "Stock on Saleable": st.column_config.NumberColumn("Stock on Saleable", format="%d"),
+    "Wholesale": st.column_config.NumberColumn("Wholesale", format="%d"),
+}
+st.caption(
+    "Every group starts checked. The checkbox in the Select header checks or unchecks every group. "
+    "Uncheck one row to leave its SKUs out of the tables and totals below."
 )
+kept_groups = _select_editor(
+    grouped_rows,
+    _grouped_editor_key(group_by, grouped_rows),
+    number_columns,
+    "bskuw_grouped_header",
+)
+selected_groups = set(row.get(group_by) for row in kept_groups)
+filtered_rows = [row for row in sku_rows if queries.group_value(row, group_by) in selected_groups]
 
 st.subheader("SKUs")
-total_rows = summary["rows"]
-row_args = (
-    week,
-    query_baskets,
-    chosen_product_bs,
-    sku,
-    size,
-    section,
-    aspect,
-    rim,
-    brand,
-    name,
-)
-visible = queries.basket_rows(
-    *row_args,
-    limit=DISPLAY_LIMIT,
-    start=start,
-    end=end,
-    wholesale_min=wholesale_min,
-    wholesale_max=wholesale_max,
-    include_outside=include_outside,
-    outside_only=outside_only,
-    grade=grade,
-    treads=chosen_treads,
-)
-if total_rows > DISPLAY_LIMIT:
-    st.caption("Showing the first {limit:,} of {total:,} rows.".format(limit=DISPLAY_LIMIT, total=total_rows))
-st.dataframe(
-    visible,
-    hide_index=True,
-    width="stretch",
-    column_config={
-        "Stock": st.column_config.NumberColumn("Stock", format="%.3f"),
-        "Wholesale": st.column_config.NumberColumn("Wholesale", format="%d"),
-    },
-)
-
-full_rows = (
-    visible
-    if total_rows <= DISPLAY_LIMIT
-    else queries.basket_rows(
-        *row_args,
-        start=start,
-        end=end,
-        wholesale_min=wholesale_min,
-        wholesale_max=wholesale_max,
-        include_outside=include_outside,
-        outside_only=outside_only,
-        grade=grade,
-        treads=chosen_treads,
+visible = filtered_rows[:DISPLAY_LIMIT]
+if len(filtered_rows) > DISPLAY_LIMIT:
+    st.caption(
+        "Showing the first {limit:,} of {total:,} rows. Saleable stock follows the checked rows in this table.".format(
+            limit=DISPLAY_LIMIT, total=len(filtered_rows)
+        )
     )
+st.caption(
+    "Every SKU row starts checked. The checkbox in the Select header checks or unchecks every row. "
+    "Stock on Saleable is the saleable tires of that SKU and grade. "
+    "Uncheck one row to leave that SKU and grade out of the totals and out of saleable stock."
 )
+kept_visible = _select_editor(
+    visible,
+    _sku_editor_key(visible),
+    number_columns,
+    "bskuw_skus_header",
+)
+saleable_pairs = _pairs_from_rows(kept_visible)
 st.download_button(
     "Download CSV",
-    data=_to_csv(full_rows),
+    data=_to_csv(filtered_rows),
     file_name="basket-skus-{week}.csv".format(week=week),
     mime="text/csv",
-    disabled=not full_rows,
+    disabled=not filtered_rows,
 )
 
 _saleable_section(
-    sku,
-    grade,
+    saleable_pairs,
     week,
     None if outside_only else query_baskets,
 )

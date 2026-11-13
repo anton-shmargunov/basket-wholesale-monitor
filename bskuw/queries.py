@@ -46,6 +46,35 @@ def _filled(column, label):
     return "coalesce(nullif(trim({column}), ''), '(no {label})')".format(column=column, label=label)
 
 
+def group_value(row, group_by):
+    """Group label for a SKU table row, matching the Grouped table."""
+    if group_by == "Section-Aspect-Rim":
+        return "{section}-{aspect}-{rim}".format(
+            section=_blank_group(row.get("Section"), "section"),
+            aspect=_blank_group(row.get("Aspect"), "aspect"),
+            rim=_blank_group(row.get("Rim"), "rim"),
+        )
+    columns = {
+        "SKU": ("SKU", "SKU"),
+        "Size": ("Size", "size"),
+        "Section": ("Section", "section"),
+        "Aspect": ("Aspect", "aspect"),
+        "Rim": ("Rim", "rim"),
+        "Brand": ("Brand", "brand"),
+        "Name": ("Name", "name"),
+        "Basket": ("Basket", "basket"),
+    }
+    column, label = columns[group_by]
+    return _blank_group(row.get(column), label)
+
+
+def _blank_group(value, label):
+    text = "" if value is None else str(value).strip()
+    if text:
+        return text
+    return "(no {label})".format(label=label)
+
+
 def _group_key(group_by, sku, size, section, aspect, rim, brand, name):
     """Return the grouping expression and its column label."""
     section_text = _filled(section, "section")
@@ -142,17 +171,37 @@ def _stored_grade_clause(grade, column):
     return "{column} = '{value}'".format(column=column, value=value)
 
 
+def _saleable_grades_cte():
+    """Count saleable tires once for each SKU and grade.
+
+    One tire is one quant ID whose location contains Saleable. Majority maps
+    to grade A or B. A tire whose Majority is neither stays on a blank grade.
+    """
+    return """
+        saleable_grades AS (
+            SELECT
+                trim(sku) AS sku,
+                coalesce({grade_expr}, '') AS grade,
+                count(*) AS tires
+            FROM saleable
+            GROUP BY 1, 2
+        )
+    """.format(grade_expr=_sale_grade_expr("majority"))
+
+
 def _graded_ctes(member_where, date_where, grade):
     """Stock rows by tracking grade, plus sales of a grade that has no stock.
 
     present is every tracking grade in the selected baskets. sold is wholesale
     by Majority. extra is a stock-0 row for a Majority grade the basket does
-    not already list for that SKU.
+    not already list for that SKU. saleable is the quant ID count for that
+    SKU and grade, the same number on every basket row.
     """
     return """
         sold AS (
             {sold_sql}
         ),
+        {saleable_cte},
         present AS (
             SELECT
                 t.basket,
@@ -221,11 +270,15 @@ def _graded_ctes(member_where, date_where, grade):
                 p.condition,
                 p.dim_sku,
                 p.stock,
-                coalesce(s.sold, 0) AS sold
+                coalesce(s.sold, 0) AS sold,
+                coalesce(q.tires, 0) AS saleable
             FROM present p
             LEFT JOIN sold s
                 ON s.sku = p.sku
                AND coalesce(s.sale_grade, '') = p.grade
+            LEFT JOIN saleable_grades q
+                ON q.sku = trim(p.sku)
+               AND q.grade = p.grade
             WHERE {stored_grade}
             UNION ALL
             SELECT
@@ -244,12 +297,17 @@ def _graded_ctes(member_where, date_where, grade):
                 e.condition,
                 e.dim_sku,
                 e.stock,
-                e.sold
+                e.sold,
+                coalesce(q.tires, 0) AS saleable
             FROM extra e
+            LEFT JOIN saleable_grades q
+                ON q.sku = trim(e.sku)
+               AND q.grade = e.grade
             WHERE {extra_grade}
         )
     """.format(
         sold_sql=_sold_sql(date_where, grade),
+        saleable_cte=_saleable_grades_cte(),
         member_where=member_where,
         stored_grade=_stored_grade_clause(grade, "p.grade"),
         extra_grade=_stored_grade_clause(grade, "e.grade"),
@@ -264,86 +322,174 @@ def saleable_count():
     return row[0]
 
 
-def saleable_summary(sku, grade=None, year_week=None, baskets=None):
-    """Saleable tires of one SKU by grade, beside that week's tracking stock.
+def _clean_pairs(pairs):
+    """Unique (sku, grade) pairs. A blank grade is the unmapped Majority."""
+    cleaned = []
+    seen = set()
+    for pair in pairs or []:
+        sku = "" if pair[0] is None else str(pair[0]).strip()
+        grade = ""
+        if len(pair) > 1 and pair[1] is not None:
+            grade = str(pair[1]).strip()
+        if not sku:
+            continue
+        key = (sku, grade)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(key)
+    return cleaned
 
-    Saleable tires are quant rows whose Location contains Saleable.
-    Tracking stock is the weekly average for the selected baskets.
+
+def _chosen_pairs_sql(pairs, params):
+    holders = []
+    for sku, grade in pairs:
+        holders.append("(?, ?)")
+        params.append(sku)
+        params.append(grade)
+    return "(VALUES {values}) AS chosen(sku, grade)".format(values=", ".join(holders))
+
+
+def _saleable_basket_sql(year_week, baskets, params):
+    if not year_week or not baskets:
+        return "FALSE"
+    basket_params = []
+    clause = "t.year_week = ? AND {baskets}".format(
+        baskets=_in_clause("t.basket", list(baskets), basket_params)
+    )
+    params.append(year_week)
+    params.extend(basket_params)
+    return clause
+
+
+def saleable_summary(pairs, year_week=None, baskets=None):
+    """Saleable tires of the chosen SKU and grade pairs, beside tracking stock.
+
+    Each pair is one SKU and one grade. Tracking stock is the weekly average
+    for the selected baskets and can differ from the quant count.
     """
-    text = "" if sku is None else str(sku).strip()
-    if not text:
+    chosen = _clean_pairs(pairs)
+    if not chosen:
         return []
-    basket_sql = "FALSE"
-    params = [text, text]
-    if year_week and baskets:
-        basket_params = []
-        basket_sql = "t.year_week = ? AND {baskets}".format(
-            baskets=_in_clause("t.basket", list(baskets), basket_params)
-        )
-        params.extend([year_week])
-        params.extend(basket_params)
+    params = []
+    chosen_sql = _chosen_pairs_sql(chosen, params)
+    chosen_sql_track = _chosen_pairs_sql(chosen, params)
+    basket_sql = _saleable_basket_sql(year_week, baskets, params)
+    grade_expr = _sale_grade_expr("s.majority")
     return db.fetch_dicts(
         """
         WITH quant AS (
-            SELECT coalesce({grade_expr}, '') AS grade, count(*) AS tires
+            SELECT
+                trim(s.sku) AS sku,
+                coalesce({grade_expr}, '') AS grade,
+                count(*) AS tires
             FROM saleable s
-            WHERE trim(s.sku) = ?
-              AND {grade_filter}
-            GROUP BY 1
+            JOIN {chosen_sql}
+              ON trim(s.sku) = chosen.sku
+             AND coalesce({grade_expr}, '') = chosen.grade
+            GROUP BY 1, 2
         ),
         track AS (
-            SELECT trim(coalesce(t.grade, '')) AS grade,
-                   coalesce(sum(t.stock_qty_w), 0) AS stock
+            SELECT
+                trim(t.sku) AS sku,
+                trim(coalesce(t.grade, '')) AS grade,
+                coalesce(sum(t.stock_qty_w), 0) AS stock
             FROM tracking t
-            WHERE trim(t.sku) = ?
-              AND {track_grade}
-              AND {basket_sql}
-            GROUP BY 1
+            JOIN {chosen_sql_track}
+              ON trim(t.sku) = chosen.sku
+             AND trim(coalesce(t.grade, '')) = chosen.grade
+            WHERE {basket_sql}
+            GROUP BY 1, 2
         )
         SELECT
+            coalesce(q.sku, k.sku) AS "SKU",
+            coalesce(d.name, '') AS "Name",
             coalesce(q.grade, k.grade) AS "Grade",
-            coalesce(q.tires, 0) AS "Saleable tires",
+            coalesce(q.tires, 0) AS "Stock on Saleable",
             coalesce(k.stock, 0) AS "Tracking stock"
         FROM quant q
-        FULL OUTER JOIN track k ON q.grade = k.grade
+        FULL OUTER JOIN track k ON q.sku = k.sku AND q.grade = k.grade
+        LEFT JOIN sku_dim d ON d.sku = coalesce(q.sku, k.sku)
         ORDER BY
+            coalesce(q.sku, k.sku),
             CASE coalesce(q.grade, k.grade) WHEN 'A' THEN 0 WHEN 'B' THEN 1 ELSE 2 END,
             coalesce(q.grade, k.grade)
         """.format(
-            grade_expr=_sale_grade_expr("s.majority"),
-            grade_filter=_sale_grade_clause(grade, "s.majority"),
-            track_grade=_tracking_grade_clause(grade, "t.grade"),
+            grade_expr=grade_expr,
+            chosen_sql=chosen_sql,
+            chosen_sql_track=chosen_sql_track,
             basket_sql=basket_sql,
         ),
         params,
     )
 
 
-def saleable_tires(sku, grade=None):
-    """One row per saleable tire of this SKU: ID, grade, Majority, location."""
-    text = "" if sku is None else str(sku).strip()
-    if not text:
-        return []
+def saleable_tire_count(pairs):
+    """How many saleable tires belong to these SKU and grade pairs."""
+    chosen = _clean_pairs(pairs)
+    if not chosen:
+        return 0
+    params = []
     grade_expr = _sale_grade_expr("s.majority")
+    row = db.fetch_one(
+        """
+        SELECT count(*)
+        FROM saleable s
+        JOIN {chosen_sql}
+          ON trim(s.sku) = chosen.sku
+         AND coalesce({grade_expr}, '') = chosen.grade
+        """.format(
+            chosen_sql=_chosen_pairs_sql(chosen, params),
+            grade_expr=grade_expr,
+        ),
+        params,
+    )
+    if row is None:
+        return 0
+    return row[0]
+
+
+def saleable_tires(pairs, limit=None):
+    """One row per saleable tire: ID, SKU, name, grade, Majority, location."""
+    chosen = _clean_pairs(pairs)
+    if not chosen:
+        return []
+    params = []
+    grade_expr = _sale_grade_expr("s.majority")
+    limit_sql = ""
+    if limit is not None:
+        limit_sql = " LIMIT ?"
+        params_limit = [int(limit)]
+    else:
+        params_limit = []
+    chosen_sql = _chosen_pairs_sql(chosen, params)
+    params.extend(params_limit)
     return db.fetch_dicts(
         """
         SELECT
             s.tire_id AS "ID",
+            trim(s.sku) AS "SKU",
+            coalesce(d.name, '') AS "Name",
             coalesce({grade_expr}, '') AS "Grade",
             coalesce(s.majority, '') AS "Majority",
             coalesce(s.location, '') AS "Location"
         FROM saleable s
-        WHERE trim(s.sku) = ?
-          AND {grade_filter}
+        JOIN {chosen_sql}
+          ON trim(s.sku) = chosen.sku
+         AND coalesce({grade_expr}, '') = chosen.grade
+        LEFT JOIN sku_dim d ON d.sku = trim(s.sku)
         ORDER BY
+            trim(s.sku),
             CASE coalesce({grade_expr}, '') WHEN 'A' THEN 0 WHEN 'B' THEN 1 ELSE 2 END,
             TRY_CAST(s.tire_id AS BIGINT),
             s.tire_id
+        {limit_sql}
         """.format(
             grade_expr=grade_expr,
-            grade_filter=_sale_grade_clause(grade, "s.majority"),
+            chosen_sql=chosen_sql,
+            limit_sql=limit_sql,
         ),
-        [text],
+        params,
     )
 
 
@@ -636,9 +782,13 @@ def basket_rows(
             outside_skus.tread AS "Tread",
             outside_skus.condition AS "Condition",
             NULL AS "Product BS",
-            CAST(0 AS DOUBLE) AS "Stock",
+            CAST(0 AS DOUBLE) AS "Tracking Stock",
+            coalesce(q.tires, 0) AS "Stock on Saleable",
             outside_skus.sold AS "Wholesale"
         FROM ({outside_select}) outside_skus
+        LEFT JOIN saleable_grades q
+            ON q.sku = trim(outside_skus.sku)
+           AND q.grade = coalesce(outside_skus.sale_grade, '')
         """,
     )
     limit_sql = ""
@@ -665,7 +815,8 @@ def basket_rows(
                 tread AS "Tread",
                 condition AS "Condition",
                 product_bs AS "Product BS",
-                stock AS "Stock",
+                stock AS "Tracking Stock",
+                saleable AS "Stock on Saleable",
                 sold AS "Wholesale"
             FROM graded
             WHERE {bounds}
@@ -716,8 +867,9 @@ def basket_grouped(
     range, and both totals use only those SKUs. Grouping by size, section, aspect,
     rim, the section-aspect-rim combination, brand, name, or SKU counts each tire once.
     Grouping by basket counts a tire in every
-    selected basket that contains its SKU. Stock is summed across the tracking
-    rows that remain.
+    selected basket that contains its SKU. Tracking Stock is the tracking average,
+    summed across the tracking rows that remain. Stock on Saleable counts each
+    saleable tire once for its SKU and grade.
     """
     if group_by not in WHOLESALE_GROUPS:
         raise ValueError("Unknown grouping: {group}".format(group=group_by))
@@ -749,13 +901,14 @@ def basket_grouped(
             mode(aspect) AS "Aspect",
             mode(rim) AS "Rim",
             count(DISTINCT sku) AS "SKUs",
-            coalesce(sum(stock), 0) AS "Stock",
+            coalesce(sum(stock), 0) AS "Tracking Stock",
+            coalesce(sum(saleable), 0) AS "Stock on Saleable",
             coalesce(sum(sold), 0) AS "Wholesale"
         FROM filtered
         GROUP BY basket
         ORDER BY
             CASE WHEN basket = '(no basket)' THEN 1 ELSE 0 END,
-            "Stock" DESC,
+            "Tracking Stock" DESC,
             "Wholesale" DESC,
             TRY_CAST(basket AS INTEGER),
             basket
@@ -776,7 +929,8 @@ def basket_grouped(
             {column} AS "{label}",
             {dimensions}
             count(*) AS "SKUs",
-            coalesce(sum(stock), 0) AS "Stock",
+            coalesce(sum(stock), 0) AS "Tracking Stock",
+            coalesce(sum(saleable), 0) AS "Stock on Saleable",
             coalesce(sum(sold), 0) AS "Wholesale"
         FROM (
             SELECT
@@ -788,6 +942,7 @@ def basket_grouped(
                 any_value(brand) AS brand,
                 any_value(name) AS name,
                 sum(stock) AS stock,
+                sum(saleable) AS saleable,
                 sum(sold) AS sold
             FROM (
                 SELECT
@@ -800,6 +955,7 @@ def basket_grouped(
                     any_value(brand) AS brand,
                     any_value(name) AS name,
                     sum(stock) AS stock,
+                    max(saleable) AS saleable,
                     max(sold) AS sold
                 FROM filtered
                 GROUP BY sku, grade
@@ -807,7 +963,7 @@ def basket_grouped(
             GROUP BY sku
         ) sku_level
         GROUP BY {column}
-        ORDER BY "Stock" DESC, "Wholesale" DESC, "{label}"
+        ORDER BY "Tracking Stock" DESC, "Wholesale" DESC, "{label}"
         """.format(
             column=column,
             label=label,
@@ -962,8 +1118,12 @@ def _filtered_members_sql(
             coalesce(nullif(outside_skus.brand, ''), '(no brand)') AS brand,
             coalesce(nullif(outside_skus.name, ''), '(no name)') AS name,
             CAST(0 AS DOUBLE) AS stock,
+            coalesce(q.tires, 0) AS saleable,
             outside_skus.sold AS sold
         FROM ({outside_select}) outside_skus
+        LEFT JOIN saleable_grades q
+            ON q.sku = trim(outside_skus.sku)
+           AND q.grade = coalesce(outside_skus.sale_grade, '')
         """,
     )
     sql = """
@@ -980,6 +1140,7 @@ def _filtered_members_sql(
                 coalesce(nullif(g.brand, ''), '(no brand)') AS brand,
                 coalesce(nullif(g.name, ''), '(no name)') AS name,
                 g.stock,
+                g.saleable,
                 g.sold
             FROM graded g
             WHERE {bounds}
@@ -1065,7 +1226,8 @@ def _outside_only_rows(
         """
         WITH sold AS (
             {sold_sql}
-        )
+        ),
+        {saleable_cte}
         SELECT
             '(no basket)' AS "Basket",
             outside_skus.sku AS "SKU",
@@ -1080,13 +1242,18 @@ def _outside_only_rows(
             outside_skus.tread AS "Tread",
             outside_skus.condition AS "Condition",
             NULL AS "Product BS",
-            CAST(0 AS DOUBLE) AS "Stock",
+            CAST(0 AS DOUBLE) AS "Tracking Stock",
+            coalesce(q.tires, 0) AS "Stock on Saleable",
             outside_skus.sold AS "Wholesale"
         FROM ({outside_select}) outside_skus
+        LEFT JOIN saleable_grades q
+            ON q.sku = trim(outside_skus.sku)
+           AND q.grade = coalesce(outside_skus.sale_grade, '')
         ORDER BY "Size", "SKU", "Grade"
         {limit_sql}
         """.format(
             sold_sql=_sold_sql(date_sql, grade),
+            saleable_cte=_saleable_grades_cte(),
             outside_select=outside_select,
             limit_sql=limit_sql,
         ),
@@ -1112,6 +1279,7 @@ def _outside_only_members_sql(
                     CAST(NULL AS VARCHAR) AS brand,
                     CAST(NULL AS VARCHAR) AS name,
                     CAST(0 AS DOUBLE) AS stock,
+                    CAST(0 AS BIGINT) AS saleable,
                     CAST(0 AS BIGINT) AS sold
                 WHERE FALSE
             )
@@ -1126,6 +1294,7 @@ def _outside_only_members_sql(
         WITH sold AS (
             {sold_sql}
         ),
+        {saleable_cte},
         filtered AS (
             SELECT
                 '(no basket)' AS basket,
@@ -1138,11 +1307,16 @@ def _outside_only_members_sql(
                 coalesce(nullif(outside_skus.brand, ''), '(no brand)') AS brand,
                 coalesce(nullif(outside_skus.name, ''), '(no name)') AS name,
                 CAST(0 AS DOUBLE) AS stock,
+                coalesce(q.tires, 0) AS saleable,
                 outside_skus.sold AS sold
             FROM ({outside_select}) outside_skus
+            LEFT JOIN saleable_grades q
+                ON q.sku = trim(outside_skus.sku)
+               AND q.grade = coalesce(outside_skus.sale_grade, '')
         )
     """.format(
         sold_sql=_sold_sql(date_sql, grade),
+        saleable_cte=_saleable_grades_cte(),
         outside_select=outside_select,
     )
     return sql, list(date_params) + list(outside_params)

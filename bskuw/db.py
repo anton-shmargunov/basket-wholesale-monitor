@@ -125,11 +125,17 @@ def get_connection():
 
 
 def export_snapshot():
-    """Write a consistent copy of the open database and return that file."""
+    """Write a consistent copy of the open database and return that file.
+
+    The copy reads committed data. A checkpoint only folds the write-ahead log
+    into the main file. Another open write transaction blocks that checkpoint,
+    and the copy still proceeds.
+    """
     connection = get_connection()
     snapshot = DB_PATH.with_name("bskuw-snapshot.duckdb")
     with _LOCK:
-        connection.execute("CHECKPOINT")
+        _rollback_if_open(connection)
+        _checkpoint_if_free(connection)
         _remove_database_files(snapshot)
         connection.execute("ATTACH '{path}' AS bskuw_snapshot".format(path=_sql_path(snapshot)))
         source = connection.execute(
@@ -178,6 +184,23 @@ def replace_database(payload):
             ) from exc
         _remove_database_files(Path(str(DB_PATH) + ".wal"))
         _CONNECTION = _open_database(DB_PATH)
+
+
+def _rollback_if_open(connection):
+    """Drop a leftover transaction so the copy is the last committed database."""
+    try:
+        connection.execute("ROLLBACK")
+    except duckdb.TransactionException:
+        return
+
+
+def _checkpoint_if_free(connection):
+    """Fold the write-ahead log when no other write transaction is open."""
+    try:
+        connection.execute("CHECKPOINT")
+    except duckdb.TransactionException as exc:
+        if "other write transactions" not in str(exc):
+            raise
 
 
 def _open_database(path):
