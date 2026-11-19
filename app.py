@@ -1,7 +1,11 @@
+from pathlib import Path
+
 import streamlit as st
 
 from bskuw import queries
 from bskuw.db import get_connection
+
+LOGO = Path(__file__).resolve().parent / "assets" / "sidebar_transparent.png"
 
 
 def home():
@@ -29,7 +33,32 @@ def home():
         st.info("No tracking data yet. Open Data and load a tracking basket report.")
 
 
-st.set_page_config(page_title="Basket-Wholesale Monitor (BWM)", layout="wide")
+st.set_page_config(
+    page_title="Basket-Wholesale Monitor (BWM)",
+    page_icon=str(LOGO),
+    layout="wide",
+)
+with st.sidebar:
+    st.image(str(LOGO), width="stretch")
+st.markdown(
+    """
+    <style>
+    [data-testid="stSidebarContent"] {
+        display: flex;
+        flex-direction: column;
+    }
+    [data-testid="stSidebarHeader"] { order: 0; }
+    [data-testid="stSidebarUserContent"] { order: 1; }
+    [data-testid="stSidebarNav"] { order: 2; }
+    [data-testid="stSidebarUserContent"] [data-testid="stImage"] {
+        width: 60%;
+        margin-left: auto;
+        margin-right: auto;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.navigation(
     [
         st.Page(home, title="Home", default=True),
